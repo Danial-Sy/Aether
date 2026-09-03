@@ -1,0 +1,9 @@
+* text=auto
+*.bat text eol=crlf
+*.vbs text eol=crlf
+*.ps1 text eol=crlf
+*.sh text eol=lf
+*.desktop text eol=lf
+*.png binary
+*.ico binary
+

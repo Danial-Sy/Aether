@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-or-later -->
+<!-- Copyright (C) 2026 Danial Syed -->
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aether</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@15.0.12/marked.min.js"></script>
+</head>
+<body class="is-warming">
+  <div id="warmSplash" class="warm-splash" role="status" aria-live="polite">
+    <div class="warm-inner">
+      <div class="brand-mark warm-ring" aria-hidden="true"></div>
+      <p class="warm-title">Warming up</p>
+      <p class="warm-sub" id="warmSub">Loading your model…</p>
+    </div>
+  </div>
+  <div id="app" class="app app-hidden">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-name">Aether</div>
+      </div>
+
+      <button class="btn-primary new-chat" id="btnNewChat"><span>+</span> New</button>
+
+      <nav class="side-nav">
+        <button class="side-tab active" data-panel="history">History</button>
+        <button class="side-tab" data-panel="projects">Projects</button>
+        <button class="side-tab" data-panel="memory">Memory</button>
+        <button class="side-tab" data-panel="settings">Settings</button>
+      </nav>
+
+      <div class="side-panels">
+        <div class="side-panel active" id="panel-history">
+          <div class="panel-label">Chat</div>
+          <div class="chat-list" id="chatListChat"></div>
+          <div class="panel-label">Agentic</div>
+          <div class="chat-list" id="chatListAgentic"></div>
+        </div>
+        <div class="side-panel" id="panel-projects">
+          <button class="btn-ghost full" id="btnNewProject">+ Add project folder</button>
+          <div class="project-list" id="projectList"></div>
+        </div>
+        <div class="side-panel" id="panel-memory">
+          <form id="memoryForm" class="memory-form">
+            <textarea id="memoryInput" rows="3" placeholder="Save a lasting note…"></textarea>
+            <button type="submit" class="btn-ghost">Save</button>
+          </form>
+          <div class="memory-list" id="memoryList"></div>
+        </div>
+        <div class="side-panel" id="panel-settings">
+          <label class="field">
+            <span>Auto-compact threshold</span>
+            <input type="range" id="setCompact" min="70" max="98" value="85" />
+            <em id="setCompactVal">85%</em>
+          </label>
+          <label class="field check">
+            <span>Show thinking</span>
+            <input type="checkbox" id="setShowThinking" class="theme-check" checked />
+          </label>
+          <label class="field check">
+            <span>Always ask before starting</span>
+            <input type="checkbox" id="setClarifyFirst" class="theme-check" />
+          </label>
+          <p class="ctx-hint">Agentic mode asks clarifying questions whenever a choice would change the result. Turn this on to make it ask at least once before starting any new task. Answers are remembered as canon, so it never asks the same thing twice.</p>
+          <label class="field check">
+            <span>Unrestricted file access</span>
+            <input type="checkbox" id="setUnrestrictedFs" class="theme-check" />
+          </label>
+          <p class="ctx-hint">Lets file tools reach anywhere your user account can read, not just the allowed roots. Shell commands still run, so only enable this if you are comfortable with that.</p>
+          <label class="field">
+            <span>Shell command approval</span>
+            <select id="setShellApproval">
+              <option value="always_ask">Ask every time</option>
+              <option value="safe_auto">Auto-run safe commands</option>
+              <option value="never_ask">Never ask</option>
+            </select>
+          </label>
+          <p class="ctx-hint">Auto-run safe commands lets Aether work without interrupting you: it runs your project's code, edits its files, installs packages and uses git freely. It stops only for things you would want to catch: deleting files (rm, shred), sudo, disk and system commands, writes into system folders, piping a download straight into a shell, and git push / reset --hard / clean -f. Approve one of those with "Always allow" and it will not ask again. Ask every time confirms every command; Never ask runs everything unattended.</p>
+          <p class="ctx-hint">Defaults are the highest comfortable settings for a 3090 Ti 24GB + 32GB RAM with q8 KV. You can push higher, but expect slower responses from RAM spill.</p>
+          <label class="field">
+            <span>Chat context (Qwen3.8)</span>
+            <select id="setChatCtx">
+              <option value="32768" selected>32K (recommended)</option>
+              <option value="65536">64K (slower)</option>
+              <option value="131072">128K (RAM spill likely)</option>
+              <option value="262144">256K (slower / RAM spill)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Reasoning context (Qwen3.8)</span>
+            <select id="setReasonCtx">
+              <option value="16384">16K</option>
+              <option value="32768" selected>32K (recommended)</option>
+              <option value="65536">64K (slower)</option>
+              <option value="131072">128K (RAM spill likely)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Coder context (Qwen3-Coder)</span>
+            <select id="setCoderCtx">
+              <option value="32768" selected>32K (recommended)</option>
+              <option value="65536">64K (slower)</option>
+              <option value="131072">128K (RAM spill likely)</option>
+              <option value="262144">256K (slower / RAM spill)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Agent context (Qwen3.8)</span>
+            <select id="setAgentCtx">
+              <option value="32768" selected>32K (recommended)</option>
+              <option value="65536">64K (slower)</option>
+              <option value="131072">128K (RAM spill likely)</option>
+              <option value="262144">256K (slower / RAM spill)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Repeated-call stop limit</span>
+            <input type="number" id="setAgentRepeatLimit" min="2" max="10" value="3" />
+          </label>
+          <button class="btn-ghost" id="btnSaveSettings">Save</button>
+          <div class="model-status" id="modelStatus"></div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-btn" id="btnToggleSidebar" title="Sidebar">☰</button>
+        <div class="mode-tabs" role="tablist">
+          <button class="mode-tab active" data-mode="chat">Chat</button>
+          <button class="mode-tab" data-mode="agentic">Agentic</button>
+          <span class="mode-ink" id="modeInk"></span>
+        </div>
+        <div class="top-controls">
+          <div class="ctx-wrap" id="ctxWrap">
+            <button type="button" class="context-meter" id="contextMeter" title="Context window">
+              <svg class="ctx-ring" id="ctxRingVisual" viewBox="0 0 36 36" aria-hidden="true">
+                <circle class="ctx-ring-track" cx="18" cy="18" r="14" fill="none" />
+                <circle class="ctx-ring-fill" id="ctxRingFill" cx="18" cy="18" r="14" fill="none"
+                  pathLength="100" stroke-dasharray="0 100" transform="rotate(-90 18 18)" />
+              </svg>
+              <span id="ctxPct">0%</span>
+            </button>
+            <div class="ctx-dropdown" id="ctxDropdown" hidden>
+              <div class="ctx-dd-title">Context window</div>
+              <div class="ctx-dd-model" id="ctxDdModel">...</div>
+              <input type="range" id="ctxSlider" min="0" max="3" step="1" value="2" />
+              <div class="ctx-dd-val" id="ctxDdVal">128K</div>
+              <p class="ctx-dd-hint">Higher = more room, but may spill to RAM and slow down.</p>
+              <hr class="ctx-dd-sep" />
+              <button type="button" class="ctx-compact-btn" id="btnCompactNow">Compact now</button>
+              <p class="ctx-dd-hint" id="ctxCompactHint">Summarizes the older turns and frees the window. Nothing is deleted.</p>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <section class="workspace">
+        <div class="chat-area" id="chatArea">
+          <div class="empty-state" id="emptyState">
+            <div class="empty-hero">
+              <div class="brand-mark" id="emptyRing" aria-hidden="true"></div>
+              <p class="empty-tagline" id="emptyTagline">What can we tackle together?</p>
+            </div>
+            <h1 id="emptyTitle" hidden>Aether</h1>
+          </div>
+          <div class="messages" id="messages" hidden></div>
+        </div>
+        <aside class="project-drawer" id="projectDrawer" hidden>
+          <div class="drawer-head">
+            <strong>Project</strong>
+            <select id="projectSelect"></select>
+          </div>
+          <div class="drawer-tree" id="projectTree"></div>
+        </aside>
+      </section>
+
+      <footer class="composer">
+        <div id="approvalDock" class="approval-dock" hidden></div>
+        <div id="agentTodoPanel" class="agent-todo-panel" hidden>
+          <button type="button" class="agent-todo-toggle" id="agentTodoToggle" aria-expanded="true">
+            <div class="agent-todo-toggle-main">
+              <span class="agent-todo-label">Plan</span>
+              <span class="agent-todo-count" id="agentTodoCount">0 of 0 done</span>
+            </div>
+            <div class="agent-todo-bar" aria-hidden="true"><div class="agent-todo-bar-fill" id="agentTodoBarFill"></div></div>
+            <svg class="agent-todo-chev" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M4.5 6.5L8 10l3.5-3.5"/></svg>
+          </button>
+          <ul class="agent-todo-list" id="agentTodoList"></ul>
+        </div>
+        <div id="fileLibrary" class="file-library" hidden>
+          <div class="file-library-label">Files in this chat</div>
+          <div class="file-library-chips" id="fileLibraryChips"></div>
+        </div>
+        <div class="attach-chips" id="attachChips"></div>
+        <div class="composer-inner">
+          <textarea id="input" rows="1" placeholder="How can I help you today?"></textarea>
+          <div class="composer-toolbar">
+            <div class="plus-wrap">
+              <button class="plus-btn" id="btnPlus" type="button" title="Add">+</button>
+              <div class="plus-menu" id="plusMenu" hidden>
+                <button data-action="files"><span class="mi">📎</span> Add files or photos <kbd>Ctrl+U</kbd></button>
+                <button data-action="screenshot"><span class="mi">📷</span> Take a screenshot</button>
+                <button data-action="attach-folder"><span class="mi">📂</span> Attach folder</button>
+                <button data-action="folder"><span class="mi">📁</span> Add project folder</button>
+                <hr />
+                <button data-action="websearch" id="btnWebSearchToggle"><span class="mi">🌐</span> Web search <span class="check" id="webSearchCheck" hidden>✓</span></button>
+              </div>
+            </div>
+
+            <div class="toolbar-right">
+              <div class="model-picker" id="modelPicker">
+                <button type="button" class="model-trigger" id="modelTrigger" aria-haspopup="listbox" aria-expanded="false">
+                  <span class="model-trigger-label-wrap">
+                    <span class="model-trigger-label" id="modelTriggerLabel">Qwen3.8 27B</span>
+                    <span class="think-chip" id="thinkChip" hidden>Think</span>
+                  </span>
+                  <svg class="chev" viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M4.5 6.5L8 10l3.5-3.5"/></svg>
+                </button>
+                <div class="model-menu" id="modelMenu" hidden role="listbox">
+                  <div class="model-group" data-group="chat">
+                    <button type="button" class="model-option" data-model="general">
+                      <div class="mo-text">
+                        <div class="mo-title">Qwen3.8 27B</div>
+                        <div class="mo-desc">Everyday chat and multimodal</div>
+                      </div>
+                      <span class="mo-check" hidden>✓</span>
+                    </button>
+                    <button type="button" class="model-option" data-model="reasoning">
+                      <div class="mo-text">
+                        <div class="mo-title">Qwen3.8 27B</div>
+                        <div class="mo-desc">For complex reasoning and logic</div>
+                      </div>
+                      <span class="mo-check" hidden>✓</span>
+                    </button>
+                    <hr class="think-sep" id="thinkSep" hidden />
+                    <button type="button" class="think-toggle" id="btnThinkToggle" hidden>
+                      <div class="mo-text">
+                        <div class="mo-title">Thinking</div>
+                        <div class="mo-desc" id="thinkToggleDesc">On, deeper reasoning</div>
+                      </div>
+                      <span class="check" id="thinkCheck">✓</span>
+                    </button>
+                  </div>
+                  <div class="model-group" data-group="agentic" hidden>
+                    <button type="button" class="model-option" data-model="agent">
+                      <div class="mo-text">
+                        <div class="mo-title">Qwen3.8 27B</div>
+                        <div class="mo-desc">Default agent, sees screenshots and reasons best</div>
+                      </div>
+                      <span class="mo-check" hidden>✓</span>
+                    </button>
+                    <button type="button" class="model-option" data-model="coder">
+                      <div class="mo-text">
+                        <div class="mo-title">Qwen3-Coder 30B</div>
+                        <div class="mo-desc">~4× faster, no vision, good for smaller jobs</div>
+                      </div>
+                      <span class="mo-check" hidden>✓</span>
+                    </button>
+                    <hr />
+                    <button type="button" class="toggle-option" id="btnComputerUse">
+                      <div class="mo-text">
+                        <div class="mo-title">Computer use</div>
+                        <div class="mo-desc">Screenshots and UI guidance (uses Qwen3.8)</div>
+                      </div>
+                      <span class="check" id="computerUseCheck" hidden>✓</span>
+                    </button>
+                  </div>
+                    <hr class="think-sep" id="effortSep" />
+                    <div class="effort-row" id="effortRow">
+                      <div class="mo-text">
+                        <div class="mo-title">Reasoning effort</div>
+                        <div class="mo-desc" id="effortDesc">Medium</div>
+                      </div>
+                      <input type="range" id="effortSlider" class="effort-slider"
+                             min="0" max="4" step="1" value="3"
+                             aria-label="Reasoning effort" />
+                    </div>
+                    <div class="effort-ticks" id="effortTicks" aria-hidden="true"></div>
+                </div>
+              </div>
+
+              <button class="send-btn" id="btnSend" title="Send" type="button" aria-label="Send">
+                <svg class="icon-send" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3.4 20.6L21 12 3.4 3.4l2.3 7.3L14 12l-8.3 1.3z"/></svg>
+                <svg class="icon-stop" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M7.05 5.64L12 10.59l4.95-4.95 1.41 1.41L13.41 12l4.95 4.95-1.41 1.41L12 13.41l-4.95 4.95-1.41-1.41L10.59 12 5.64 7.05z"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="composer-meta"><span id="statusLine"></span></div>
+      </footer>
+    </main>
+  </div>
+
+  <div class="model-warm" id="modelWarmOverlay" hidden>
+    <div class="model-warm-card">
+      <div class="brand-mark warm-ring spin" id="modelWarmRing" aria-hidden="true"></div>
+      <div class="model-warm-title" id="modelWarmTitle">Warming model…</div>
+      <div class="model-warm-sub">This only takes a moment</div>
+    </div>
+  </div>
+
+  <div class="overlay" id="compactOverlay" hidden>
+    <div class="overlay-card">
+      <div class="spinner"></div>
+      <div class="overlay-title">Compacting conversation</div>
+      <div class="overlay-sub">Preserving goals, decisions, and key details…</div>
+    </div>
+  </div>
+
+    <div class="lightbox" id="imageLightbox" hidden>
+    <button type="button" class="lightbox-close" id="lightboxClose" aria-label="Close">✕</button>
+    <img id="lightboxImg" alt="Preview" />
+  </div>
+
+  <input type="file" id="filePicker" multiple accept="*/*" hidden />
+
+  <dialog id="projectDialog">
+    <form method="dialog" id="projectDialogForm" class="dialog-card">
+      <h2>Add project</h2>
+      <label><span>Name</span> <input class="dialog-field" name="name" required placeholder="My Project" /></label>
+      <label><span>Folder path</span>
+        <div class="path-row">
+          <input class="dialog-field" name="root" id="projectRootInput" required placeholder="~/Projects/MyRepo" />
+          <button type="button" class="btn-ghost" id="btnBrowseProject">Browse</button>
+        </div>
+      </label>
+      <label><span>Notes</span> <input class="dialog-field" name="description" placeholder="Optional" /></label>
+      <div class="dialog-actions">
+        <button type="button" class="btn-ghost" id="btnProjectCancel">Cancel</button>
+        <button type="button" class="btn-primary" id="btnProjectOk">Create</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirmDialog">
+    <form method="dialog" class="dialog-card" id="confirmForm">
+      <h2 id="confirmTitle">Are you sure?</h2>
+      <p id="confirmBody" class="confirm-body"></p>
+      <div class="dialog-actions">
+        <button type="submit" value="cancel" formnovalidate class="btn-ghost" id="confirmCancel">Cancel</button>
+        <button type="submit" value="ok" class="btn-primary danger" id="confirmOk">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="promptDialog">
+    <form method="dialog" class="dialog-card" id="promptForm">
+      <h2 id="promptTitle">Edit</h2>
+      <label><span id="promptLabel">Name</span>
+        <textarea id="promptInput" class="dialog-field" rows="4" required placeholder="Type here…"></textarea>
+      </label>
+      <div class="dialog-actions">
+        <button type="submit" value="cancel" formnovalidate class="btn-ghost">Cancel</button>
+        <button type="submit" value="ok" class="btn-primary" id="promptOk">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall -q -x '(^|/)(data|\.venv)(/|$)' .
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Check JavaScript syntax
+        run: node --check static/app.js
+
+  validate-windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Parse Windows PowerShell installer
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "scripts/install-windows.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List
+            exit 1
+          }
+      - name: Test setup model detection
+        run: python -m unittest discover -s tests -p test_setup.py -v
+      - name: Compile Windows entry-point modules
+        run: python -m py_compile setup.py config.py desktop.py ollama_client.py
+
+  release:
+    needs: [validate, validate-windows-installer]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build source archive
+        env:
+          TAG: ${{ github.ref_name }}
+        run: git archive --format=zip --prefix="aether-${TAG}/" --output="aether-${TAG}.zip" HEAD
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" "aether-${TAG}.zip" --verify-tag --generate-notes --title "Aether $TAG"

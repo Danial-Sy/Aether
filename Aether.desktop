@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Aether
+Comment=Local Aether desktop chat (Ollama)
+Exec=aether.sh
+Path=.
+Icon=aether
+Terminal=false
+Categories=Utility;
+Keywords=AI;Chat;LLM;Ollama;Agent;
+StartupNotify=false
+StartupWMClass=Desktop.py
+SingleMainWindow=true
