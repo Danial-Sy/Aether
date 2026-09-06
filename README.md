@@ -3,22 +3,30 @@
 A local AI desktop app. Chat and a real coding agent, both running on your own
 machine through Ollama.
 
-Two tabs. **Chat** is a normal conversation with Qwen3.8 27B, with a deeper
-reasoning mode and vision. **Agentic** is a full tool-calling agent that reads
-and writes files in a project you point it at, runs shell commands, keeps a task
-list, and asks you when it needs a decision.
+Two tabs. **Chat** is a normal conversation, with a deeper reasoning mode and
+vision when the model has it. **Agentic** is a full tool-calling agent that
+reads and writes files in a project you point it at, runs shell commands, keeps
+a task list, and asks you when it needs a decision.
 
 Everything stays on the computer. Model weights are downloaded by Ollama and are
 not part of this repository. Web search is optional and off by default.
 
-> **Before you install:** Aether is currently built for two specific models,
-> Qwen3.8 27B and Qwen3-Coder 30B, and it needs a GPU with at least **24 GB of
-> VRAM** to be usable. On a smaller card the model will either crawl or fail to
-> load outright.
->
-> A future version will detect your hardware and pull smaller models that fit, so
-> Aether can run on weaker cards too. That is not in this release. For now, plan
-> on those two models and 24 GB of VRAM.
+**Any Ollama model works, and any GGUF on Hugging Face.** The installer detects
+your hardware and suggests models that suit it. Afterwards, a browser inside
+Aether covers both libraries: everything on
+[ollama.com/library](https://ollama.com/library), and the tens of thousands of
+GGUF repositories on [Hugging Face](https://huggingface.co/models?library=gguf),
+searchable, sortable and filtered to what your machine can hold. Picking a model
+shows every version of it with real download sizes, and says up front what a
+model is missing — no tool support, no chat template, vision that will not
+survive the import. Ollama does the download either way, so a Hugging Face model
+is probed, assigned and run by the same code as any other. Each one is assigned
+to Chat, Agentic, or both, and capabilities are read from Ollama, so a model
+that cannot call tools is never offered for agentic work.
+
+The defaults are Qwen3.8 27B and Qwen3-Coder 30B, which is what Aether was
+built and tuned on. They need a 24 GB card. Everything below still works on
+less.
 
 ## What it can do
 
@@ -37,24 +45,36 @@ the reference.
 
 ## Hardware
 
-Aether needs a GPU with at least 24 GB of VRAM. Qwen3.8 27B is about 17.7 GB
-resident, and the KV cache at the agentic default adds roughly 5.8 GB on top, so
-the working set sits near 21 GB with a little headroom on a 24 GB card. Below
-that, the model spills into system RAM and becomes unusably slow, or does not
-load at all. 32 GB of system RAM is also worth having.
+Aether runs on what you have. The installer reads your GPU, memory and free
+disk, then suggests models sized for it:
 
-| Profile | Models | Download |
-|---|---|---:|
-| Chat | `qwen2.5:0.5b`, `qwen3.8:27b` | ~19 GB |
-| Full | Chat plus `qwen3-coder:30b` | ~38 GB |
+| Usable memory | Suggested |
+|---|---|
+| under 6 GB | one 4B model doing both jobs |
+| 6 to 12 GB | 8B for chat, 7B coder for agentic |
+| 12 to 20 GB | 14B pair |
+| 20 to 64 GB | Qwen3.8 27B and Qwen3-Coder 30B, the tuned default |
+| 64 GB and up | adds a 70B for chat |
+| no GPU | 8B and 7B, sized for speed rather than for what fits |
 
-The small model only writes chat titles and runs on CPU.
+VRAM is what counts when you have a GPU. Without one, models run on the CPU, and
+the suggestion is capped well below what would merely fit: 128 GB of RAM will
+hold a 70B, and it will answer at about a word a second.
+
+The tuned default needs a 24 GB card. Qwen3.8 27B is about 17.7 GB resident and
+the KV cache at the agentic window adds roughly 5.8 GB, so the working set sits
+near 21 GB. Aether works out the largest window each model can have on your
+machine and offers exactly those.
+
+A small model (`qwen2.5:0.5b`, about 400 MB) comes with every choice. It only
+writes chat titles, on the CPU, so naming a conversation never interrupts the
+model you are talking to.
 
 ## Windows
 
 1. Download and extract the latest release.
 2. Double-click **`Install-Aether.bat`**.
-3. Accept the suggested model profile or pick another.
+3. Choose Default, Recommended for your PC, or type your own model tag.
 4. Launch from the new Desktop or Start Menu shortcut.
 
 The installer is a wizard. It detects or installs Python 3.11+ and Ollama through
@@ -72,6 +92,8 @@ Install-Aether.bat -Models Full -NonInteractive
 Install-Aether.bat -SkipModels -NonInteractive
 ```
 
+To move to a newer version later, double-click **`Update-Aether.bat`**.
+
 ## Ubuntu
 
 ```bash
@@ -80,17 +102,33 @@ sudo apt install -y python3 python3-venv python3-pip python3-gi \
   gir1.2-gtk-3.0 gir1.2-webkit2-4.1
 curl -fsSL https://ollama.com/install.sh | sh
 
-chmod +x setup.sh aether.sh install-desktop.sh
+chmod +x setup.sh aether.sh install-desktop.sh update.sh
 ./setup.sh
 ./aether.sh
 ```
 
-If `gir1.2-webkit2-4.1` is not available, install `gir1.2-webkit2-4.0`. Use
-`./setup.sh --models chat` for the smaller profile, or `--skip-models` if Ollama
-already has the weights.
+If `gir1.2-webkit2-4.1` is not available, install `gir1.2-webkit2-4.0`.
+
+`setup.sh` asks which models you want: Default, Recommended for your machine, or
+a tag you type. Use `--yes` to take the recommendation without being asked,
+`--tags qwen3:8b` to name models directly, or `--skip-models` if Ollama already
+has the weights.
 
 `setup.bat` and `setup.py` are the direct entry points if Python and Ollama are
 already set up and you do not want the wizard.
+
+## Updating
+
+```bash
+./update.sh          # Ubuntu
+```
+
+```bat
+Update-Aether.bat
+```
+
+`data/` and `.venv/` are never touched, so chats, memory, projects, settings and
+uploads survive an update.
 
 ## Your data
 
@@ -113,6 +151,8 @@ Defaults assume a standard local Ollama install. For custom layouts:
 | `AETHER_OLLAMA_MODELS` | Custom Ollama model directory |
 | `AETHER_AI_ROOT` | A workspace containing a sibling `ollama` directory |
 | `OLLAMA_HOST` | Ollama API address |
+| `AETHER_UPDATE_REPO` | GitHub repository the updater tracks |
+| `GITHUB_TOKEN` | Raises the updater's GitHub rate limit |
 
 Model metadata, context sizes and system prompts are in `config.py`. Per-user
 settings are written to `data/settings/settings.json` at runtime.
@@ -151,7 +191,10 @@ git tag v1.3.0
 git push origin v1.3.0
 ```
 
-The archive excludes `.venv`, model weights, and everything under `data/`.
+The archive excludes `.venv`, model weights, and everything under `data/`. That
+published release is what `update.py` compares against, so bump `VERSION` in
+`config.py` and `aether.json` in the same commit as the tag — the updater reads
+`config.py` to decide whether a copy is current.
 
 ## License
 

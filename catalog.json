@@ -1,0 +1,253 @@
+{
+  "version": 1,
+  "note": "Curated shortcuts, not a whitelist. Any Ollama tag can be installed by typing it. Capability hints are for display before install; the real answer comes from /api/show afterwards. size_gb is GiB of weights.",
+  "library_url": "https://ollama.com/library",
+  "utility": [
+    { "tag": "qwen2.5:0.5b", "roles": ["title"] }
+  ],
+  "tiers": [
+    {
+      "id": "tiny",
+      "min_gb": 0,
+      "max_gb": 6,
+      "label": "Under 6 GB",
+      "note": "One small model doing both jobs. Expect short tasks rather than long agentic runs.",
+      "models": [{ "tag": "qwen3:4b", "roles": ["chat", "agentic"] }]
+    },
+    {
+      "id": "small",
+      "min_gb": 6,
+      "max_gb": 12,
+      "label": "6 to 12 GB",
+      "models": [
+        { "tag": "qwen3:8b", "roles": ["chat"] },
+        { "tag": "qwen2.5-coder:7b", "roles": ["agentic"] }
+      ]
+    },
+    {
+      "id": "medium",
+      "min_gb": 12,
+      "max_gb": 20,
+      "label": "12 to 20 GB",
+      "models": [
+        { "tag": "qwen3:14b", "roles": ["chat"] },
+        { "tag": "qwen2.5-coder:14b", "roles": ["agentic"] }
+      ]
+    },
+    {
+      "id": "default",
+      "min_gb": 20,
+      "max_gb": 32,
+      "label": "20 to 32 GB",
+      "note": "What Aether was built and tuned on.",
+      "models": [
+        { "tag": "qwen3.8:27b", "roles": ["chat", "agentic"] },
+        { "tag": "qwen3-coder:30b", "roles": ["agentic"] }
+      ]
+    },
+    {
+      "id": "large",
+      "min_gb": 32,
+      "max_gb": 64,
+      "label": "32 to 64 GB",
+      "note": "The tuned pair with room for a much longer context window.",
+      "models": [
+        { "tag": "qwen3.8:27b", "roles": ["chat", "agentic"] },
+        { "tag": "qwen3-coder:30b", "roles": ["agentic"] }
+      ]
+    },
+    {
+      "id": "xlarge",
+      "min_gb": 64,
+      "max_gb": null,
+      "label": "64 GB and up",
+      "note": "A 70B for chat, with the vision model kept for computer use.",
+      "models": [
+        { "tag": "llama3.3:70b", "roles": ["chat"] },
+        { "tag": "qwen3.8:27b", "roles": ["chat", "agentic"] },
+        { "tag": "qwen3-coder:30b", "roles": ["agentic"] }
+      ]
+    }
+  ],
+  "models": {
+    "qwen3.8:27b": {
+      "label": "Qwen3.8 27B",
+      "description": "Aether's default. Sees images, thinks, and calls tools, so it covers chat, agentic work and computer use on its own.",
+      "size_gb": 15.7,
+      "rank": 100,
+      "tags": ["default", "vision", "thinking", "tools"],
+      "hints": { "tools": true, "vision": true, "think": true },
+      "kv_bytes_per_token": 88500,
+      "tuning": { "temperature": 0.7, "top_p": 0.95, "top_k": 20, "repeat_penalty": 1.0 }
+    },
+    "qwen3-coder:30b": {
+      "label": "Qwen3-Coder 30B",
+      "description": "Mixture of experts, so it emits tool calls much faster than a dense model its size. No vision.",
+      "size_gb": 17.3,
+      "rank": 95,
+      "tags": ["default", "coding", "tools", "fast"],
+      "hints": { "tools": true, "vision": false, "think": false },
+      "tuning": { "temperature": 0.7, "top_p": 0.8, "top_k": 20, "repeat_penalty": 1.05 }
+    },
+    "qwen3:4b": {
+      "label": "Qwen3 4B",
+      "description": "Smallest model that still calls tools reliably. The floor for agentic work.",
+      "size_gb": 2.3,
+      "rank": 70,
+      "tags": ["small", "tools", "thinking"],
+      "hints": { "tools": true, "vision": false, "think": true }
+    },
+    "qwen3:8b": {
+      "label": "Qwen3 8B",
+      "description": "General chat and light agentic work on a mid-range card.",
+      "size_gb": 4.9,
+      "rank": 80,
+      "tags": ["small", "tools", "thinking"],
+      "hints": { "tools": true, "vision": false, "think": true }
+    },
+    "qwen3:14b": {
+      "label": "Qwen3 14B",
+      "description": "Noticeably stronger reasoning than 8B, still comfortable on 16 GB.",
+      "size_gb": 8.6,
+      "rank": 82,
+      "tags": ["tools", "thinking"],
+      "hints": { "tools": true, "vision": false, "think": true }
+    },
+    "qwen3:32b": {
+      "label": "Qwen3 32B",
+      "description": "Dense 32B for chat and reasoning when there is memory to spare.",
+      "size_gb": 18.8,
+      "rank": 78,
+      "tags": ["tools", "thinking"],
+      "hints": { "tools": true, "vision": false, "think": true }
+    },
+    "qwen3:30b-a3b": {
+      "label": "Qwen3 30B A3B",
+      "description": "Mixture of experts general model. Fast for its size, thinks and calls tools.",
+      "size_gb": 17.3,
+      "rank": 84,
+      "tags": ["tools", "thinking", "fast"],
+      "hints": { "tools": true, "vision": false, "think": true }
+    },
+    "qwen2.5-coder:7b": {
+      "label": "Qwen2.5-Coder 7B",
+      "description": "Small coding agent. Fits alongside a chat model on 12 GB.",
+      "size_gb": 4.4,
+      "rank": 74,
+      "tags": ["small", "coding", "tools"],
+      "hints": { "tools": true, "vision": false, "think": false }
+    },
+    "qwen2.5-coder:14b": {
+      "label": "Qwen2.5-Coder 14B",
+      "description": "Mid-size coding agent, a clear step up from 7B on multi-file work.",
+      "size_gb": 8.4,
+      "rank": 80,
+      "tags": ["coding", "tools"],
+      "hints": { "tools": true, "vision": false, "think": false }
+    },
+    "qwen2.5-coder:32b": {
+      "label": "Qwen2.5-Coder 32B",
+      "description": "Dense coding model. Slower per step than the 30B MoE but strong on hard edits.",
+      "size_gb": 18.5,
+      "rank": 76,
+      "tags": ["coding", "tools"],
+      "hints": { "tools": true, "vision": false, "think": false }
+    },
+    "devstral:24b": {
+      "label": "Devstral 24B",
+      "description": "Built specifically for agentic coding and tool use in a codebase.",
+      "size_gb": 13.3,
+      "rank": 79,
+      "tags": ["coding", "tools", "agentic"],
+      "hints": { "tools": true, "vision": false, "think": false }
+    },
+    "gemma3:4b": {
+      "label": "Gemma 3 4B",
+      "description": "Small model that can see images. No tool calling, so chat only.",
+      "size_gb": 3.1,
+      "rank": 60,
+      "tags": ["small", "vision"],
+      "hints": { "tools": false, "vision": true, "think": false }
+    },
+    "gemma3:12b": {
+      "label": "Gemma 3 12B",
+      "description": "Strong multimodal chat. No tool calling, so chat only.",
+      "size_gb": 7.6,
+      "rank": 68,
+      "tags": ["vision"],
+      "hints": { "tools": false, "vision": true, "think": false }
+    },
+    "gemma3:27b": {
+      "label": "Gemma 3 27B",
+      "description": "Largest Gemma 3. Excellent multimodal chat, but it cannot call tools.",
+      "size_gb": 16.2,
+      "rank": 66,
+      "tags": ["vision"],
+      "hints": { "tools": false, "vision": true, "think": false }
+    },
+    "mistral-small3.2:24b": {
+      "label": "Mistral Small 3.2 24B",
+      "description": "Multimodal and calls tools, so it can cover chat, agentic and computer use.",
+      "size_gb": 14.1,
+      "rank": 85,
+      "tags": ["vision", "tools"],
+      "hints": { "tools": true, "vision": true, "think": false }
+    },
+    "llama3.2:3b": {
+      "label": "Llama 3.2 3B",
+      "description": "Very small and quick. Tool calling is unreliable at this size.",
+      "size_gb": 1.9,
+      "rank": 50,
+      "tags": ["small", "tools"],
+      "hints": { "tools": true, "vision": false, "think": false }
+    },
+    "llama3.1:8b": {
+      "label": "Llama 3.1 8B",
+      "description": "Well-rounded general chat model with tool calling.",
+      "size_gb": 4.6,
+      "rank": 72,
+      "tags": ["small", "tools"],
+      "hints": { "tools": true, "vision": false, "think": false }
+    },
+    "llama3.3:70b": {
+      "label": "Llama 3.3 70B",
+      "description": "Frontier-class chat quality locally. Needs roughly 48 GB before it is comfortable.",
+      "size_gb": 39.6,
+      "rank": 88,
+      "tags": ["large", "tools"],
+      "hints": { "tools": true, "vision": false, "think": false }
+    },
+    "deepseek-r1:14b": {
+      "label": "DeepSeek-R1 14B",
+      "description": "Reasoning specialist. Thinks at length, so give it a generous context window.",
+      "size_gb": 8.4,
+      "rank": 70,
+      "tags": ["thinking", "tools"],
+      "hints": { "tools": true, "vision": false, "think": true }
+    },
+    "phi4:14b": {
+      "label": "Phi-4 14B",
+      "description": "Compact and strong at maths and structured reasoning.",
+      "size_gb": 8.4,
+      "rank": 64,
+      "tags": ["thinking"],
+      "hints": { "tools": false, "vision": false, "think": false }
+    },
+    "granite3.3:8b": {
+      "label": "Granite 3.3 8B",
+      "description": "IBM's small instruct model. Apache licensed, solid tool calling.",
+      "size_gb": 4.6,
+      "rank": 62,
+      "tags": ["small", "tools"],
+      "hints": { "tools": true, "vision": false, "think": true }
+    },
+    "qwen2.5:0.5b": {
+      "label": "Qwen2.5 0.5B",
+      "description": "Names chats on the CPU so the main model is never interrupted.",
+      "size_gb": 0.4,
+      "rank": 10,
+      "tags": ["utility", "tiny"],
+      "hints": { "tools": true, "vision": false, "think": false }
+    }
+  }
+}

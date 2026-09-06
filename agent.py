@@ -450,23 +450,55 @@ def project_is_large(project_root: Path | None) -> bool:
 _TOOL_DEFS_NO_DELEGATE = [t for t in TOOL_DEFS if t["function"]["name"] != "delegate"]
 
 
-def tool_defs_for(chat: dict | None) -> list[dict]:
+# Dropped in this order when the schemas would eat too much of a small window.
+# Everything after this list is what agentic work cannot be done without, so it
+# is never trimmed. ask_user goes last because losing it makes the agent guess.
+TRIM_ORDER = ("delegate", "remember", "git_status", "check_toolchains",
+              "validate_file", "append_file", "ask_user")
+# All 14 schemas cost ~4.1k tokens. A third of a small window spent describing
+# tools leaves nothing for the work, and the model reads less of what matters.
+SCHEMA_BUDGET_FRACTION = 0.15
+
+
+def schema_tokens(defs: list[dict]) -> int:
+    from ollama_client import estimate_tokens
+    return estimate_tokens(json.dumps(defs, ensure_ascii=False))
+
+
+def trim_tool_defs(defs: list[dict], ctx_limit: int | None) -> list[dict]:
+    """Drop the least essential schemas until they fit the window's share."""
+    if not ctx_limit or ctx_limit <= 0:
+        return defs
+    budget = int(int(ctx_limit) * SCHEMA_BUDGET_FRACTION)
+    if schema_tokens(defs) <= budget:
+        return defs
+    kept = list(defs)
+    for name in TRIM_ORDER:
+        if schema_tokens(kept) <= budget:
+            break
+        kept = [t for t in kept if t["function"]["name"] != name]
+    return kept
+
+
+def tool_defs_for(chat: dict | None, ctx_limit: int | None = None) -> list[dict]:
     """Tool schemas for this run. Sub-agents get a restricted, non-recursive set."""
     # Presence of the key marks a sub-run, not its truthiness. An empty spec is
     # falsy, and reading that as "not a sub-agent" hands the child delegate.
     if not isinstance(chat, dict) or "subagent" not in chat:
         # Set once per run by the loop, the only place that knows the project
         # root. Absent means gated off, which is the safe default.
-        return TOOL_DEFS if (chat or {}).get("delegate_available") else _TOOL_DEFS_NO_DELEGATE
+        base = TOOL_DEFS if (chat or {}).get("delegate_available") else _TOOL_DEFS_NO_DELEGATE
+        return trim_tool_defs(base, ctx_limit)
     spec = chat.get("subagent") or {}
     allowed = {str(t) for t in (spec.get("tools") or SUBAGENT_DEFAULT_TOOLS)}
     # Never recursive: a sub-agent that can delegate can spawn without bound.
     allowed.discard("delegate")
     picked = [t for t in TOOL_DEFS if t["function"]["name"] in allowed]
     # An empty allowlist would leave the sub-agent unable to do anything at all.
-    return picked or [
+    picked = picked or [
         t for t in TOOL_DEFS if t["function"]["name"] in SUBAGENT_DEFAULT_TOOLS
     ]
+    return trim_tool_defs(picked, ctx_limit)
 
 
 # Never the answer to "where is my code". Scanning them floods results with
@@ -2367,11 +2399,97 @@ def _remember(args: dict, project_id: str | None) -> str:
     return json.dumps({"ok": True, "scope": scope})
 
 
-# Parse tool calls: Ollama native tool_calls, plus XML-ish fallbacks.
+# Parse tool calls: Ollama native tool_calls, plus the shapes models emit when
+# they answer in prose instead. Measured on llama3.2:3b with the real schemas,
+# 2 of 16 replies put the call in content, both on the deeply nested schemas
+# (todo_write, ask_user). Without this the loop reads them as a final answer.
 TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*\{(.*?)\}\s*</tool_call>",
     re.DOTALL | re.IGNORECASE,
 )
+# Mistral's template; the payload is a JSON array.
+TOOL_CALLS_PREFIX_RE = re.compile(r"\[TOOL_CALLS\]\s*(\[.*\])\s*$", re.DOTALL)
+FENCED_JSON_RE = re.compile(r"```(?:json|tool_call)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
+
+
+def _known_tool_names() -> set[str]:
+    return {t["function"]["name"] for t in TOOL_DEFS}
+
+
+def _as_tool_call(obj: object) -> dict | None:
+    """One parsed object, if it actually names a registered tool."""
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name") or obj.get("tool") or obj.get("function")
+    if isinstance(name, dict):
+        obj, name = name, name.get("name")
+    if not isinstance(name, str) or name not in _known_tool_names():
+        return None
+    args = obj.get("arguments")
+    if args is None:
+        args = obj.get("parameters")
+    if args is None:
+        args = obj.get("args") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(args, dict):
+        return None
+    return {"id": name, "name": name, "arguments": args}
+
+
+def _calls_from_payload(payload: object) -> list[dict]:
+    items = payload if isinstance(payload, list) else [payload]
+    return [c for c in (_as_tool_call(i) for i in items) if c]
+
+
+def _trailing_json(text: str) -> str | None:
+    """A JSON object or array that runs to the end of the reply.
+
+    Models often write a sentence and then the call ("Here is the plan:\n{...}").
+    Requiring it to reach the end is what keeps a call quoted mid-sentence, which
+    is followed by more prose, from being executed.
+    """
+    text = (text or "").rstrip()
+    if not text or text[-1] not in "}]":
+        return None
+    for i, ch in enumerate(text):
+        if ch in "{[":
+            return text[i:]
+    return None
+
+
+def parse_content_tool_calls(content: str) -> list[dict]:
+    """Tool calls a model wrote into its reply instead of the tool_calls field.
+
+    An explicit marker is trusted anywhere. Bare JSON is only trusted when it
+    is the entire reply, so prose that merely quotes a call is never executed.
+    """
+    text = (content or "").strip()
+    if not text:
+        return []
+    calls: list[dict] = []
+    marker = TOOL_CALLS_PREFIX_RE.search(text)
+    if marker:
+        try:
+            calls.extend(_calls_from_payload(json.loads(marker.group(1))))
+        except json.JSONDecodeError:
+            pass
+    for block in FENCED_JSON_RE.findall(text):
+        try:
+            calls.extend(_calls_from_payload(json.loads(block)))
+        except json.JSONDecodeError:
+            pass
+    if not calls:
+        tail = _trailing_json(text)
+        if tail:
+            try:
+                calls.extend(_calls_from_payload(json.loads(tail)))
+            except json.JSONDecodeError:
+                pass
+    return calls
 
 
 def extract_tool_calls(message: dict) -> list[dict]:
@@ -2415,7 +2533,35 @@ def extract_tool_calls(message: dict) -> list[dict]:
                 calls.append({"id": name, "name": name, "arguments": obj.get("arguments") or {}})
         except Exception:
             pass
+    # Only when the model produced nothing usable natively, so a model that does
+    # both does not run the same call twice.
+    if not calls:
+        calls.extend(parse_content_tool_calls(content))
     return calls
+
+
+def looks_like_broken_tool_call(content: str) -> str | None:
+    """The name of a tool this reply tried to call but wrote unparseably.
+
+    Observed on llama3.2:3b: it emitted todo_write into the message body with
+    `[` where `{` belonged, so the JSON never parsed and the run ended having
+    done nothing. The arguments are not recoverable and guessing them would
+    execute something the model did not ask for, so this only reports that a
+    call was attempted; the loop turns that into a retry.
+    """
+    text = (content or "").strip()
+    # Either the reply is the call, or the call runs to the end of it. A call
+    # quoted mid-sentence has prose after it and is left alone.
+    candidate = _trailing_json(text) or (text if text and text[0] in "{[" else None)
+    if not candidate or '"name"' not in candidate:
+        return None
+    if parse_content_tool_calls(text):
+        return None
+    text = candidate
+    for name in _known_tool_names():
+        if f'"{name}"' in text:
+            return name
+    return None
 
 
 def normalize_questions(args: dict) -> list[dict]:
@@ -2713,10 +2859,27 @@ def _elide_large_replay_input(fn: dict) -> None:
         )
 
 
-def tools_system_addon() -> str:
-    names = ", ".join(t["function"]["name"] for t in TOOL_DEFS)
+ASK_USER_GUIDANCE = (
+    "Clarifying questions (ask_user):\n"
+    "- ask_user is the ONLY way to talk to the user mid-job. It blocks until they answer.\n"
+    "- Ask when a choice would change what you build: ambiguous scope, two valid approaches,\n"
+    "  an unstated preference, an unclear target file. Ask EARLY, before writing code, not after.\n"
+    "- Batch related questions into one ask_user call (up to 4). Give 2-4 concrete options each.\n"
+    "- Read the Established canon block first. If it already answers something, use that answer\n"
+    "  and do NOT ask again.\n"
+    "- Do not ask about things you can find out yourself with a tool. Read the file instead.\n"
+    "- After they answer, keep going in the same job. Do not restart.\n"
+)
+
+
+def tools_system_addon(defs: list[dict] | None = None) -> str:
+    """Guidance for the tools this run actually has, so the prompt never names
+    one that was trimmed away."""
+    defs = defs if defs is not None else TOOL_DEFS
+    names = [t["function"]["name"] for t in defs]
+    listed = ", ".join(names)
     return (
-        f"\n\n# Tools\nAvailable tools: {names}.\n"
+        f"\n\n# Tools\nAvailable tools: {listed}.\n"
         "Use native function calling whenever an action or more information is needed. "
         "Never print a tool call as XML, JSON, or a code block. The runtime executes native calls, "
         "appends each named result, and samples you again. A normal assistant message with no tool "
@@ -2747,16 +2910,8 @@ def tools_system_addon() -> str:
         "- If the toolchain is missing and the install needs sudo, ask_user for it; you cannot run sudo.\n"
         "- npm -g, pip, npx and rustup work without sudo, so use them directly. For a one-off "
         "TypeScript run prefer `npx tsx file.ts` over a global install.\n"
-        "Clarifying questions (ask_user):\n"
-        "- ask_user is the ONLY way to talk to the user mid-job. It blocks until they answer.\n"
-        "- Ask when a choice would change what you build: ambiguous scope, two valid approaches,\n"
-        "  an unstated preference, an unclear target file. Ask EARLY, before writing code, not after.\n"
-        "- Batch related questions into one ask_user call (up to 4). Give 2-4 concrete options each.\n"
-        "- Read the Established canon block first. If it already answers something, use that answer\n"
-        "  and do NOT ask again.\n"
-        "- Do not ask about things you can find out yourself with a tool. Read the file instead.\n"
-        "- After they answer, keep going in the same job. Do not restart.\n"
-        "Paths: all file paths are relative to the Active project Root. "
+        + (ASK_USER_GUIDANCE if "ask_user" in names else "")
+        + "Paths: all file paths are relative to the Active project Root. "
         "If the repo has nested folders (e.g. reedus_llm/...), include that prefix. "
         "If a tool returns suggestions, use one of them instead of retrying the same bad path.\n"
         "Shell: use python3 (not python). Prefer bash. conda may be unavailable, use full env paths if needed.\n"

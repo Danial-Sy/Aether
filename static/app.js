@@ -244,19 +244,26 @@ function currentEffort() {
 
 const state = {
   mode: "chat", // chat | agentic
-  modelKey: "general",
-  warmedKey: null, // last model key confirmed resident in VRAM
+  // Every installed model, keyed by its Ollama tag. Filled from /api/models.
+  modelsById: {},
+  chatModel: null,
+  visionModel: null,
+  reasoning: false, // the chat model with thinking forced on
+  warmedKey: null, // last model id confirmed resident in VRAM
   think: false, // off by default for snappy chat; toggle in model menu
   // Reasoning effort. null = follow the model's own default (see /api/health),
   // so the reasoning model lands on "medium" instead of over-thinking on high.
   effort: null,
   effortLevels: ["low", "medium", "high"],
+  // Whether a tier thinks depends on the model, so the slider's descriptions
+  // are per model rather than global.
+  effortByModel: {},
+  thinkingByModel: {},
   effortMeta: {},
   modelDefaults: {},
   computerUse: false,
-  // Which model runs the job: "coder" is faster, "agent" has vision and is
-  // required for computer use. One model per run.
-  agentModel: "coder",
+  // Which model runs the job. One model per run.
+  agentModel: null,
   abortController: null,
   chatId: null,
   chats: [],
@@ -271,18 +278,55 @@ const state = {
 };
 
 
-const CTX_STEPS = {
-  general: [32768, 65536, 131072, 262144],
-  reasoning: [16384, 32768, 65536, 131072],
-  agent: [32768, 65536, 131072, 262144],
-  coder: [65536, 131072, 262144],
+// Offered windows, clamped to what the model and the card can actually serve.
+const CTX_ALL_STEPS = [8192, 16384, 32768, 65536, 131072, 262144];
+
+function ctxStepsFor(id) {
+  const meta = modelMeta(id) || {};
+  const ceiling = Number(meta.context_max || 0) || 262144;
+  const fitted = Number(meta.fit?.max_context || 0);
+  const steps = CTX_ALL_STEPS.filter((v) => v <= ceiling);
+  // Keep one rung above what fits so the window can still be pushed on purpose.
+  const capped = fitted ? steps.filter((v, i) => v <= fitted || steps[i - 1] <= fitted) : steps;
+  return capped.length ? capped : [CTX_ALL_STEPS[0]];
+}
+
+/** The window this model currently runs at, per model then per role. */
+function ctxCurrentFor(id) {
+  const perModel = (state.settings.model_context || {})[id];
+  if (perModel) return Number(perModel);
+  const role = isAgenticMode() ? "agentic" : isReasoning() ? "reasoning" : "chat";
+  return Number((state.settings.role_context || {})[role] || 32768);
+}
+
+const CTX_LABELS = {
+  8192: "8K", 16384: "16K", 32768: "32K", 65536: "64K",
+  131072: "128K", 262144: "256K",
 };
-const CTX_SETTING = {
-  general: "chat_context",
-  reasoning: "reasoning_context",
-  agent: "agent_context",
-  coder: "coder_context",
-};
+
+/** One window control per role, since the window belongs to the job. */
+function renderRoleContextSelects() {
+  const roleCtx = state.settings.role_context || {};
+  $$("select[data-role]").forEach((sel) => {
+    const role = sel.dataset.role;
+    const current = Number(roleCtx[role] || 32768);
+    sel.innerHTML = "";
+    CTX_ALL_STEPS.forEach((v) => {
+      const opt = document.createElement("option");
+      opt.value = String(v);
+      opt.textContent = CTX_LABELS[v] || String(v);
+      if (v === current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    if (!CTX_ALL_STEPS.includes(current)) {
+      const opt = document.createElement("option");
+      opt.value = String(current);
+      opt.textContent = fmtCtx(current);
+      opt.selected = true;
+      sel.appendChild(opt);
+    }
+  });
+}
 
 function fmtCtx(n) {
   return `${Math.round(n / 1024)}K`;
@@ -409,6 +453,7 @@ async function resubmitEditedMessage(mid, text) {
         content: text,
         model_key: currentModelKey(),
         agent_model: isAgenticMode() ? state.agentModel : null,
+        mode: isAgenticMode() ? "agentic" : "chat",
         think: !!(modelSupportsThink() && state.think),
         effort: currentEffort(),
       }),
@@ -461,7 +506,7 @@ async function resubmitEditedMessage(mid, text) {
   }
 }
 
-let _ctxMeta = { key: "general", used: 0, limit: 131072 };
+let _ctxMeta = { key: null, used: 0, limit: 131072 };
 
 function closeCtxDropdown() {
   const wrap = $("#ctxWrap");
@@ -478,8 +523,8 @@ function openCtxDropdown() {
   // Always follow the currently selected model (not a stale last-API key)
   const key = currentModelKey();
   _ctxMeta.key = key;
-  const steps = CTX_STEPS[key] || CTX_STEPS.general;
-  const cur = Number(state.settings[CTX_SETTING[key]] || steps[Math.min(2, steps.length - 1)]);
+  const steps = ctxStepsFor(key);
+  const cur = ctxCurrentFor(key);
   let idx = steps.indexOf(cur);
   if (idx < 0) {
     idx = steps.reduce((best, v, i) => (Math.abs(v - cur) < Math.abs(steps[best] - cur) ? i : best), 0);
@@ -491,7 +536,7 @@ function openCtxDropdown() {
   const used = Number(_ctxMeta.used || 0);
   const limit = Number(steps[idx] || _ctxMeta.limit || 0);
   const usedLabel = used < 1024 ? `${used} tok` : fmtCtx(used);
-  $("#ctxDdModel").textContent = `${MODEL_META[key]?.short || key} · ${usedLabel} / ${fmtCtx(limit)}`;
+  $("#ctxDdModel").textContent = `${modelMeta(key)?.label || key} · ${usedLabel} / ${fmtCtx(limit)}`;
   $("#ctxDdVal").textContent = fmtCtx(steps[idx]);
   syncCompactBtn();
   dd.hidden = false;
@@ -576,17 +621,15 @@ async function compactNow() {
 async function applyCtxSlider() {
   const key = currentModelKey();
   _ctxMeta.key = key;
-  const steps = CTX_STEPS[key] || CTX_STEPS.general;
+  const steps = ctxStepsFor(key);
   const idx = Number($("#ctxSlider").value);
   const val = steps[idx];
   $("#ctxDdVal").textContent = fmtCtx(val);
-  const sk = CTX_SETTING[key];
-  state.settings[sk] = val;
-  // sync settings panel selects if present
-  const map = { chat_context: "setChatCtx", reasoning_context: "setReasonCtx", coder_context: "setCoderCtx", agent_context: "setAgentCtx" };
-  const el = map[sk] && $(`#${map[sk]}`);
-  if (el) el.value = String(val);
-  await api("/api/settings", { method: "PATCH", body: JSON.stringify({ data: { [sk]: val } }) });
+  // Per model, so two models sharing a role can differ.
+  const perModel = { ...(state.settings.model_context || {}), [key]: val };
+  state.settings.model_context = perModel;
+  await api("/api/settings", { method: "PATCH", body: JSON.stringify({ data: { model_context: perModel } }) });
+  await loadModelRegistry();
   await refreshContext();
 }
 
@@ -663,8 +706,8 @@ function refreshTagline() {
 }
 
 function modelSupportsThink(key = currentModelKey()) {
-  // Qwen3.8 hybrid exposes an optional thinking pass.
-  return key === "general" || key === "reasoning" || key === "agent";
+  // Ollama reports this per model; there is no list to keep in sync.
+  return !!modelMeta(key)?.think;
 }
 
 function syncThinkToggle() {
@@ -735,12 +778,24 @@ function syncThinkToggle() {
 }
 
 
-const MODEL_META = {
-  general: { short: "Qwen3.8 27B", tab: "chat" },
-  reasoning: { short: "Qwen3.8 27B", tab: "chat" },
-  agent: { short: "Qwen3.8 27B", tab: "agentic" },
-  coder: { short: "Qwen3-Coder 30B", tab: "agentic" },
-};
+/** A model's display record, or a usable stand-in for one we have not met. */
+function modelMeta(id) {
+  return state.modelsById[id] || (id ? { id, label: id, roles: [], can: {} } : null);
+}
+
+function modelLabel(id) {
+  const meta = modelMeta(id);
+  if (!meta) return "No model";
+  return state.reasoning && !isAgenticMode() && meta.can?.reasoning
+    ? `${meta.label} (Reasoning)`
+    : meta.label;
+}
+
+function modelsForRole(role) {
+  return Object.values(state.modelsById)
+    .filter((m) => (m.roles || []).includes(role === "reasoning" ? "chat" : role))
+    .filter((m) => role !== "reasoning" || m.can?.reasoning);
+}
 
 function normalizeMode(mode) {
   if (mode === "code" || mode === "computer" || mode === "agentic") return "agentic";
@@ -942,40 +997,186 @@ function showCompact(show) {
 
 function currentModelKey(mode = state.mode) {
   if (isAgenticMode(mode)) {
-    // Computer use needs vision; coder has none, so it falls back to the agent.
-    if (state.computerUse) return "agent";
-    return state.agentModel === "agent" ? "agent" : "coder";
+    // Computer use needs eyes, so it routes to whichever agentic model has them.
+    if (state.computerUse && state.visionModel) return state.visionModel;
+    return state.agentModel;
   }
-  if (state.modelKey === "reasoning") return "reasoning";
-  return "general";
+  return state.chatModel;
+}
+
+/** Deep reasoning is the chat model with thinking on, not a model of its own. */
+function isReasoning() {
+  return !isAgenticMode() && state.reasoning && !!modelMeta(state.chatModel)?.can?.reasoning;
+}
+
+/** The installed models, their roles and which one each role runs on. */
+async function loadModelRegistry() {
+  let reg;
+  try {
+    reg = await api("/api/models");
+  } catch (_) {
+    return;
+  }
+  state.modelsById = {};
+  (reg.installed || []).forEach((m) => {
+    state.modelsById[m.id] = m;
+    if (Array.isArray(m.effort_levels)) state.effortByModel[m.id] = m.effort_levels;
+    if (m.thinking) state.thinkingByModel[m.id] = m.thinking;
+    if (m.effort) state.modelDefaults[m.id] = m.effort;
+  });
+  state.registry = reg;
+  const active = reg.active || {};
+  state.visionModel = active.vision || null;
+  if (!state.chatModel || !state.modelsById[state.chatModel]) state.chatModel = active.chat || null;
+  if (!state.agentModel || !state.modelsById[state.agentModel]) state.agentModel = active.agentic || null;
+  return reg;
+}
+
+function applyEffortForModel(key) {
+  const levels = state.effortByModel[key];
+  if (!levels || !levels.length) return;
+  state.effortLevels = levels.map((l) => l.key);
+  state.effortMeta = Object.fromEntries(levels.map((l) => [l.key, l]));
+}
+
+/** The picker row for one model. Shared by the menu and the switch dialog. */
+function modelOptionRow(m, selected) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "model-option";
+  btn.dataset.model = m.id;
+  const isSel = m.id === selected;
+  btn.classList.toggle("selected", isSel);
+  const bits = [];
+  if (m.vision) bits.push("vision");
+  if (m.think) bits.push("thinking");
+  if (m.size_label) bits.push(m.size_label);
+  btn.innerHTML =
+    `<div class="mo-text"><div class="mo-title"></div><div class="mo-desc"></div></div>` +
+    `<span class="mo-check"${isSel ? "" : " hidden"}>✓</span>`;
+  btn.querySelector(".mo-title").textContent = m.label;
+  btn.querySelector(".mo-desc").textContent =
+    m.description || bits.join(" · ") || m.id;
+  return btn;
+}
+
+/** One row per model assigned to this tab, built from the registry. */
+function renderModelOptions(role, host, selected) {
+  if (!host) return;
+  const models = modelsForRole(role);
+  host.innerHTML = "";
+  models.forEach((m) => {
+    const btn = modelOptionRow(m, selected);
+    btn.onclick = () => selectModel(m.id);
+    host.appendChild(btn);
+  });
+  return models;
+}
+
+// A long model list buries the Cancel button, so the dialog opens on the few
+// most likely picks and keeps the rest behind Show more.
+const PICK_VISIBLE = 4;
+
+/** Why the loaded model cannot follow you into this tab. */
+function pickNote(role, blocked) {
+  const meta = blocked ? modelMeta(blocked) : null;
+  const label = meta ? meta.label || blocked : "";
+  if (!label) {
+    return role === "agentic"
+      ? "Pick the model to run Agentic on. Aether loads it and leaves it warm."
+      : "Pick the model to chat with. Aether loads it and leaves it warm.";
+  }
+  if (role === "agentic") {
+    return meta.can?.agentic
+      ? `${label} is loaded but is not assigned to Agentic. Pick one that is — Aether will warm it for you.`
+      : `${label} is loaded, but it has no tool calling, so it cannot run Agentic. Pick a model that does — Aether will warm it for you.`;
+  }
+  return `${label} is loaded but is not assigned to Chat. Pick a model that is — Aether will warm it for you.`;
+}
+
+/** Choose the model a tab switch should warm. Resolves to an id, or null when
+ *  the user backs out. */
+function pickRoleModel({ role, blocked = null, options = [], preferred = null }) {
+  return new Promise((resolve) => {
+    const dlg = $("#modelPickDialog");
+    const host = $("#modelPickOptions");
+    const more = $("#modelPickMore");
+    // The pick is held here rather than in dlg.returnValue: Esc closes without
+    // setting one, and a stale value would read as a choice the user never made.
+    let picked = null;
+    const selected = options.some((m) => m.id === preferred) ? preferred : null;
+    // The tab's own model leads, so the usual answer is the first row.
+    const rows = selected
+      ? [options.find((m) => m.id === selected), ...options.filter((m) => m.id !== selected)]
+      : options;
+    $("#modelPickTitle").textContent =
+      role === "agentic" ? "Pick an agentic model" : "Pick a chat model";
+    $("#modelPickNote").textContent = pickNote(role, blocked);
+    host.innerHTML = "";
+    rows.forEach((m, i) => {
+      const btn = modelOptionRow(m, selected);
+      btn.hidden = i >= PICK_VISIBLE;
+      btn.onclick = () => {
+        picked = m.id;
+        dlg.close();
+      };
+      host.appendChild(btn);
+    });
+    const hidden = Math.max(0, rows.length - PICK_VISIBLE);
+    more.hidden = !hidden;
+    more.textContent = `Show ${hidden} more`;
+    more.onclick = () => {
+      host.querySelectorAll(".model-option").forEach((b) => (b.hidden = false));
+      more.hidden = true;
+    };
+    const onClose = () => {
+      dlg.removeEventListener("close", onClose);
+      resolve(state.modelsById[picked] ? picked : null);
+    };
+    dlg.addEventListener("close", onClose);
+    dlg.showModal();
+  });
 }
 
 function syncModelPicker() {
   const key = currentModelKey();
-  state.modelKey = key;
-  const labelKey = isAgenticMode() ? state.agentModel : key;
-  const meta = MODEL_META[labelKey] || MODEL_META[key] || MODEL_META.general;
-  $("#modelTriggerLabel").textContent = meta.short;
-  syncThinkToggle();
-
-  // Show the right option group for the active tab
+  applyEffortForModel(key);
+  $("#modelTriggerLabel").textContent = modelLabel(key);
   $$(".model-group").forEach((g) => {
     g.hidden = g.dataset.group !== (isAgenticMode() ? "agentic" : "chat");
   });
 
-  const pickerValue = isAgenticMode() ? state.agentModel : key;
-  $$(".model-option").forEach((btn) => {
-    const selected = btn.dataset.model === pickerValue;
-    btn.classList.toggle("selected", selected);
-    const check = btn.querySelector(".mo-check");
-    if (check) check.hidden = !selected;
-  });
+  renderModelOptions("chat", $("#chatModelOptions"), state.chatModel);
+  const agentic = renderModelOptions("agentic", $("#agenticModelOptions"), state.agentModel);
+  const empty = $("#agenticEmpty");
+  if (empty) empty.hidden = !!(agentic && agentic.length);
 
+  // Deep reasoning is a variant of the chat model, so it is only offered when
+  // that model reports a thinking mode.
+  const canReason = !!modelMeta(state.chatModel)?.can?.reasoning;
+  const rBtn = $("#btnReasoning");
+  if (rBtn) {
+    rBtn.hidden = isAgenticMode() || !canReason;
+    rBtn.classList.toggle("active", isReasoning());
+    const rCheck = $("#reasoningCheck");
+    if (rCheck) rCheck.hidden = !isReasoning();
+  }
+
+  // Computer use needs eyes. Without a vision model it is dead, with a reason.
   const cu = $("#btnComputerUse");
   const cuCheck = $("#computerUseCheck");
+  const cuDesc = $("#computerUseDesc");
   if (cu) {
+    const ok = !!state.visionModel;
+    cu.disabled = !ok;
+    cu.classList.toggle("disabled", !ok);
     cu.classList.toggle("active", !!state.computerUse);
     if (cuCheck) cuCheck.hidden = !state.computerUse;
+    if (cuDesc) {
+      cuDesc.textContent = ok
+        ? `Screenshots and UI guidance (uses ${modelMeta(state.visionModel)?.label || state.visionModel})`
+        : "No installed model can see images";
+    }
   }
   syncThinkToggle();
 }
@@ -989,25 +1190,31 @@ function showModelWarm(show, label) {
   if (show) fillRings(el);
 }
 
-// Ollama may already hold the model from an earlier run, so ask the server what
+// Ollama may already hold a model from an earlier run, so ask the server what
 // is resident before covering the UI with a warm-up overlay.
-async function alreadyResident(key) {
+async function residentModels() {
   try {
     const st = await api("/api/warmup/status");
-    return Array.isArray(st.resident) && st.resident.includes(key);
+    // Utility models (titles and the like) sit in VRAM but route nowhere, so
+    // they can never stand in as the model a tab carries over.
+    return (st.resident || []).filter((id) => (modelMeta(id)?.roles || []).length);
   } catch (_) {
-    return false;
+    return [];
   }
 }
 
+async function alreadyResident(key) {
+  return (await residentModels()).includes(key);
+}
+
 async function warmModelKey(key) {
-  if (!key || !MODEL_META[key]) return;
+  if (!key || !state.modelsById[key]) return;
   if (state.warmedKey === key) return;
   if (await alreadyResident(key)) {
     state.warmedKey = key;
     return;
   }
-  const meta = MODEL_META[key] || {};
+  const meta = modelMeta(key) || {};
   showModelWarm(true, meta.short || meta.label || key);
   try {
     await api(`/api/warmup/model/${key}`, { method: "POST", body: "{}" });
@@ -1019,13 +1226,12 @@ async function warmModelKey(key) {
 
 /** Offload previous + warm target whenever the active model key changes. */
 async function ensureModelWarm(key, { confirm = false, title = "Switch model?" } = {}) {
-  if (!key || !MODEL_META[key]) return false;
+  if (!key || !state.modelsById[key]) return false;
   if (state.warmedKey !== key && (await alreadyResident(key))) state.warmedKey = key;
   if (state.warmedKey === key) {
-    state.modelKey = key;
     return true;
   }
-  const label = (MODEL_META[key] && (MODEL_META[key].short || MODEL_META[key].label)) || key;
+  const label = modelMeta(key)?.label || key;
   if (confirm) {
     const ok = await confirmAction({
       title,
@@ -1036,7 +1242,6 @@ async function ensureModelWarm(key, { confirm = false, title = "Switch model?" }
   }
   try {
     await warmModelKey(key);
-    state.modelKey = key;
     return true;
   } catch (e) {
     setStatus(e.message || "Warmup failed");
@@ -1044,12 +1249,65 @@ async function ensureModelWarm(key, { confirm = false, title = "Switch model?" }
   }
 }
 
+function servesRole(id, role) {
+  return !!id && (modelMeta(id)?.roles || []).includes(role);
+}
+
+/** Reconcile the model we think is warm with what Ollama actually holds, and
+ *  report that list. Ollama unloads on its own, and another window may have
+ *  loaded something else since. */
+async function syncWarmedKey() {
+  const loaded = await residentModels();
+  if (state.warmedKey && !loaded.includes(state.warmedKey)) state.warmedKey = null;
+  if (!state.warmedKey && loaded.length) state.warmedKey = loaded[0];
+  return loaded;
+}
+
+/** The model a tab switch should end up on, or null when the user backs out.
+ *
+ * Switching tabs is not a reason to change models: whatever is already in VRAM
+ * carries over when it can serve the tab, so the switch costs nothing. Only a
+ * model that cannot — no tool calling for Agentic, or unassigned to the tab —
+ * forces a load, and then the choice of what to load is the user's.
+ */
+async function modelForTab(role) {
+  const loaded = await syncWarmedKey();
+  // Both models can be resident at once, so prefer the one that fits the tab.
+  const carry = [state.warmedKey, ...loaded].find((id) => servesRole(id, role));
+  if (carry) {
+    state.warmedKey = carry;
+    return carry;
+  }
+  const options = modelsForRole(role);
+  if (!options.length) {
+    setStatus(role === "agentic"
+      ? "No installed model supports tool calling."
+      : "No installed model is assigned to Chat.");
+    return null;
+  }
+  const preferred = role === "agentic" ? state.agentModel : state.chatModel;
+  const fallback = servesRole(preferred, role) ? preferred : options[0].id;
+  // With an empty GPU there is nothing to carry over and nothing to explain,
+  // so warm this tab's own model rather than asking which one to load.
+  if (!state.warmedKey) {
+    return (await ensureModelWarm(fallback, { confirm: false })) ? fallback : null;
+  }
+  const chosen = await pickRoleModel({
+    role,
+    blocked: state.warmedKey,
+    options,
+    preferred: fallback,
+  });
+  if (!chosen) return null;
+  return (await ensureModelWarm(chosen, { confirm: false })) ? chosen : null;
+}
+
 /** Persist the active chat's model selection so a reload/reopen keeps it. */
 async function patchChatModel(cid = state.chatId) {
   if (!cid) return;
   const body = {
     mode: isAgenticMode() ? "agentic" : "chat",
-    reasoning: currentModelKey() === "reasoning",
+    reasoning: isReasoning(),
     computer_use: isAgenticMode() && state.computerUse,
   };
   if (isAgenticMode()) body.agent_model = state.agentModel;
@@ -1059,29 +1317,30 @@ async function patchChatModel(cid = state.chatId) {
 }
 
 async function selectModel(key) {
-  if (!MODEL_META[key]) return;
-  const current = isAgenticMode() ? state.agentModel : currentModelKey();
+  if (!state.modelsById[key]) return;
+  const current = isAgenticMode() ? state.agentModel : state.chatModel;
   if (key === current) {
     closeModelMenus();
     return;
   }
   closeModelMenus();
-  const ok = await ensureModelWarm(key, { confirm: true, title: "Switch model?" });
+  // Picking a model out of the menu is the consent, so warm it rather than
+  // asking again; the overlay already says what is loading.
+  const ok = await ensureModelWarm(key, { confirm: false });
   if (!ok) return;
   // Chat and Agentic are separate transcripts, so crossing that line starts a
   // new one. Swapping models within a tab must not: being forced into a fresh
   // conversation is how a pick got reverted to the default on the way out.
-  const crossesTab = MODEL_META[key].tab !== (isAgenticMode() ? "agentic" : "chat");
-  if (key === "coder" || key === "agent") {
+  const crossesTab = false;
+  if (isAgenticMode()) {
     state.mode = "agentic";
     state.agentModel = key;
-    state.modelKey = key;
-    // coder has no vision, so selecting it drops computer use.
-    if (key !== "agent") state.computerUse = false;
+    // Computer use needs eyes, so picking a blind model drops it.
+    if (!modelMeta(key)?.vision) state.computerUse = false;
   } else {
     state.mode = "chat";
     state.computerUse = false;
-    state.modelKey = key;
+    state.chatModel = key;
   }
   syncModeUI();
   if (crossesTab || !state.chatId) {
@@ -1097,7 +1356,7 @@ function updateEmpty() {
   if (isAgenticMode()) {
     $("#emptyTitle").textContent = state.computerUse ? "Computer use" : "Agentic";
   } else {
-    $("#emptyTitle").textContent = state.modelKey === "reasoning" ? "Deep reasoning" : "Chat";
+    $("#emptyTitle").textContent = isReasoning() ? "Deep reasoning" : "Chat";
   }
   refreshTagline();
   syncThinkToggle();
@@ -1137,12 +1396,7 @@ function moveModeInk() {
 
 function syncModeUI() {
   state.mode = normalizeMode(state.mode);
-  if (isAgenticMode()) {
-    state.modelKey = currentModelKey();
-  } else if (state.modelKey !== "reasoning") {
-    state.modelKey = "general";
-    state.computerUse = false;
-  }
+  if (!isAgenticMode()) state.computerUse = false;
 
   $$(".mode-tab").forEach((t) => t.classList.toggle("active", t.dataset.mode === state.mode));
   const app = $("#app");
@@ -1254,20 +1508,18 @@ try {
 async function loadHealth() {
   const h = await api("/api/health");
   state.settings = h.settings || {};
-  if (Array.isArray(h.effort_levels) && h.effort_levels.length) {
-    state.effortLevels = h.effort_levels.map((l) => l.key);
-    state.effortMeta = Object.fromEntries(h.effort_levels.map((l) => [l.key, l]));
-  }
-  (h.models || []).forEach((m) => {
-    if (m.key && m.effort) state.modelDefaults[m.key] = m.effort;
-  });
+  await loadModelRegistry();
+  applyEffortForModel(currentModelKey());
   syncThinkToggle();
-  $("#modelStatus").innerHTML = (h.models || [])
-    .map((m) => {
-      const cls = m.installed ? "ok" : "bad";
-      return `<div class="${cls}">${m.installed ? "●" : "○"} ${m.label} <code>${m.id}</code></div>`;
-    })
-    .join("");
+  const status = $("#modelStatus");
+  if (status) {
+    status.innerHTML = Object.values(state.modelsById)
+      .map((m) => {
+        const roles = (m.roles || []).join(", ") || "unassigned";
+        return `<div class="ok">● ${m.label} <code>${m.id}</code> · ${roles}</div>`;
+      })
+      .join("");
+  }
   $("#setCompact").value = Math.round((state.settings.auto_compact_at || 0.85) * 100);
   $("#setCompactVal").textContent = `${$("#setCompact").value}%`;
   $("#setShowThinking").checked = state.settings.show_thinking !== false;
@@ -1279,10 +1531,7 @@ async function loadHealth() {
       (state.settings.confirm_shell_commands === false ? "never_ask" : "always_ask");
   }
   $("#setAgentRepeatLimit").value = state.settings.agent_repeat_limit || 3;
-  if ($("#setChatCtx")) $("#setChatCtx").value = String(state.settings.chat_context || 32768);
-  if ($("#setReasonCtx")) $("#setReasonCtx").value = String(state.settings.reasoning_context || 32768);
-  if ($("#setCoderCtx")) $("#setCoderCtx").value = String(state.settings.coder_context || 32768);
-  if ($("#setAgentCtx")) $("#setAgentCtx").value = String(state.settings.agent_context || 32768);
+  renderRoleContextSelects();
   state.webSearch = !!state.settings.web_search_default;
   syncWebSearchUI();
   syncModelPicker();
@@ -1364,16 +1613,17 @@ async function openChat(id) {
   // Chats saved before hybrid was removed fall back to the executor. A chat with
   // no agent_model at all carries no opinion, so the picker's current selection
   // stands. Overwriting it here is what reverted an explicit pick on a new chat.
-  if (chat.agent_model) {
-    state.agentModel = chat.agent_model === "agent" ? "agent" : "coder";
+  if (chat.model_id && state.modelsById[chat.model_id]) {
+    state.agentModel = chat.model_id;
   }
-  let nextKey = "general";
+  state.reasoning = !!chat.reasoning;
+  let nextKey;
   if (nextMode === "agentic") {
-    // Computer use needs vision and the server forces the agent for it, so
-    // warming coder here loads the wrong 20GB of weights.
-    nextKey = nextComputer ? "agent" : state.agentModel;
+    // Computer use needs vision and the server routes it there, so warming the
+    // fast agentic model here loads the wrong 20GB of weights.
+    nextKey = nextComputer && state.visionModel ? state.visionModel : state.agentModel;
   } else {
-    nextKey = chat.reasoning ? "reasoning" : "general";
+    nextKey = state.chatModel;
   }
 
   // History switch across models must offload + warm just like the model picker
@@ -1390,7 +1640,10 @@ async function openChat(id) {
   state.chatId = chat.id;
   state.mode = nextMode;
   state.computerUse = nextComputer;
-  state.modelKey = nextKey;
+  if (nextKey) {
+    if (nextMode === "agentic") state.agentModel = nextKey;
+    else state.chatModel = nextKey;
+  }
   syncModeUI();
   renderMessages(chat.messages || []);
   renderAgentTodos(chat.agent_todos || []);
@@ -1787,9 +2040,10 @@ async function sendMessage() {
         content: text || "Please review the attachments.",
         model_key: currentModelKey(),
         agent_model: isAgenticMode() ? state.agentModel : null,
+        mode: isAgenticMode() ? "agentic" : "chat",
         think: !!(modelSupportsThink() && state.think),
         effort: currentEffort(),
-        reasoning: currentModelKey() === "reasoning",
+        reasoning: isReasoning(),
         computer_use: isAgenticMode() && state.computerUse,
         project_id: isAgenticMode() ? $("#projectSelect").value || null : null,
         web_search: state.webSearch,
@@ -1926,7 +2180,6 @@ function handleSSE(ev, streamEl) {
     showCompact(false);
     setStatus(`Using ${ev.model.label}`);
     if (ev.key) {
-      state.modelKey = ev.key;
       state.warmedKey = ev.key;
       syncModelPicker();
     }
@@ -2268,30 +2521,27 @@ function wireUI() {
       $$(".side-panel").forEach((p) => p.classList.remove("active"));
       tab.classList.add("active");
       $(`#panel-${tab.dataset.panel}`).classList.add("active");
+      if (tab.dataset.panel === "models") refreshModelsPanel();
     };
   });
+  wireLibrary();
 
   $$(".mode-tab").forEach((tab) => {
     tab.onclick = async () => {
-      const nextMode = tab.dataset.mode;
-      if (normalizeMode(nextMode) === normalizeMode(state.mode)) return;
-
+      const nextMode = normalizeMode(tab.dataset.mode);
+      if (nextMode === normalizeMode(state.mode)) return;
+      const role = nextMode === "agentic" ? "agentic" : "chat";
+      const key = await modelForTab(role);
+      if (!key) return;
       if (nextMode === "agentic") {
-        // currentModelKey() reads state.mode, still "chat" here. Without the
-        // override it warms the chat model and leaves the agentic one cold.
-        const key = currentModelKey("agentic");
-        const ok = await ensureModelWarm(key, { confirm: true, title: "Switch to Agentic?" });
-        if (!ok) return;
-        state.mode = "agentic";
-        state.modelKey = key;
+        state.agentModel = key;
+        // Computer use needs eyes, and the carried model may not have them.
+        if (!modelMeta(key)?.vision) state.computerUse = false;
       } else {
-        const key = state.modelKey === "reasoning" ? "reasoning" : "general";
-        const ok = await ensureModelWarm(key, { confirm: true, title: "Switch to Chat?" });
-        if (!ok) return;
-        state.mode = "chat";
+        state.chatModel = key;
         state.computerUse = false;
-        if (state.modelKey === "coder" || state.modelKey === "agent") state.modelKey = "general";
       }
+      state.mode = nextMode;
       state.chatId = null;
       syncModeUI();
       showEmpty();
@@ -2343,21 +2593,32 @@ function wireUI() {
     };
   }
 
+  const rBtn = $("#btnReasoning");
+  if (rBtn) {
+    rBtn.onclick = async (e) => {
+      e.stopPropagation();
+      state.reasoning = !state.reasoning;
+      syncModelPicker();
+      syncModeUI();
+      if (state.chatId) await patchChatModel();
+    };
+  }
+
   $("#btnComputerUse").onclick = async (e) => {
     e.stopPropagation();
     const next = !state.computerUse;
     // currentModelKey() still sees computerUse=true when turning it off, so it
-    // reports "agent" and warms the model we are switching away from.
-    const key = next ? "agent" : state.agentModel === "agent" ? "agent" : "coder";
+    // reports the vision model and warms the one we are switching away from.
+    const key = next ? state.visionModel : state.agentModel;
+    if (next && !key) return;
     const ok = await ensureModelWarm(key, {
       confirm: true,
-      title: next ? "Enable computer use?" : "Switch to coder?",
+      title: next ? "Enable computer use?" : "Switch model?",
     });
     if (!ok) return;
     state.computerUse = next;
-    state.modelKey = key;
     state.mode = "agentic";
-    if (next) state.agentModel = "agent";
+    if (next && state.visionModel) state.agentModel = state.visionModel;
     syncModeUI();
     await setComputerOverlay(state.computerUse);
     await patchChatModel();
@@ -2605,7 +2866,7 @@ function wireUI() {
       const used = Number(_ctxMeta.used || 0);
       const usedLabel = used < 1024 ? `${used} tok` : fmtCtx(used);
       $("#ctxDdVal").textContent = fmtCtx(limit);
-      $("#ctxDdModel").textContent = `${MODEL_META[key]?.short || key} · ${usedLabel} / ${fmtCtx(limit)}`;
+      $("#ctxDdModel").textContent = `${modelMeta(key)?.label || key} · ${usedLabel} / ${fmtCtx(limit)}`;
     };
     ctxSlider.onchange = () => applyCtxSlider();
   }
@@ -2627,10 +2888,9 @@ function wireUI() {
           unrestricted_fs: !!($("#setUnrestrictedFs") || {}).checked,
           shell_approval_mode: ($("#setShellApproval") || {}).value || "safe_auto",
           agent_repeat_limit: Number($("#setAgentRepeatLimit").value),
-          chat_context: Number($("#setChatCtx").value),
-          reasoning_context: Number($("#setReasonCtx").value),
-          coder_context: Number($("#setCoderCtx").value),
-          agent_context: Number(($("#setAgentCtx") || {}).value || 32768),
+          role_context: Object.fromEntries(
+            $$("select[data-role]").map((sel) => [sel.dataset.role, Number(sel.value)])
+          ),
           web_search_default: state.webSearch,
         },
       }),
@@ -2760,8 +3020,9 @@ async function waitForWarmup() {
       setWarmSub(data.error ? `Warmup issue: ${data.error}` : "Warmup incomplete");
       await new Promise((r) => setTimeout(r, 900));
     } else {
-      state.warmedKey = "general";
-      state.modelKey = "general";
+      // What the server actually warmed, which after a reload against a
+      // running server is not always this tab's model.
+      state.warmedKey = data.model || state.chatModel;
       setWarmSub("Ready");
       await new Promise((r) => setTimeout(r, 280));
     }
@@ -2771,6 +3032,20 @@ async function waitForWarmup() {
   } finally {
     clearTimeout(timer);
     clearInterval(poll);
+  }
+}
+
+/** Point the tab at the model that is actually loaded. A reload against a
+ *  server that is already running can find a different one in VRAM, and a
+ *  picker that names a cold model is a warm-up waiting to happen. */
+async function adoptWarmModel() {
+  await syncWarmedKey();
+  const key = state.warmedKey;
+  if (!key || !state.modelsById[key]) return;
+  if (isAgenticMode()) {
+    if (servesRole(key, "agentic")) state.agentModel = key;
+  } else if (servesRole(key, "chat")) {
+    state.chatModel = key;
   }
 }
 
@@ -2785,6 +3060,8 @@ async function boot() {
     const warm = waitForWarmup();
     await Promise.all([loadHealth(), loadChats(), loadProjects(), loadMemory()]);
     await warm;
+    await adoptWarmModel();
+    syncModeUI();
     requestAnimationFrame(moveModeInk);
   } catch (e) {
     setStatus(e.message);
@@ -2795,3 +3072,444 @@ async function boot() {
 }
 
 boot();
+
+// ── Models panel ───────────────────────────────────────────────────────────
+
+
+function gib(bytes) {
+  const n = Number(bytes || 0) / 1024 ** 3;
+  return n >= 10 ? `${Math.round(n)} GB` : `${n.toFixed(1)} GB`;
+}
+
+function renderHardware(hw) {
+  const el = $("#hwCard");
+  if (!el || !hw) return;
+  const gpu = hw.vram_bytes
+    ? `<b>${hw.gpu}</b> · ${gib(hw.vram_bytes)} VRAM`
+    : `<b>No GPU detected</b> · ${gib(hw.ram_bytes)} RAM`;
+  el.innerHTML =
+    `${gpu}<br />${gib(hw.free_disk_bytes)} free for models` +
+    `<br /><span class="model-card-size">${hw.model_store}</span>`;
+}
+
+/** One installed model: what it can do, what it serves, and how to remove it. */
+function installedCard(m) {
+  const card = document.createElement("div");
+  card.className = "model-card";
+  const bits = [];
+  if (m.vision) bits.push("vision");
+  if (m.think) bits.push("thinking");
+  if (!m.tools) bits.push("no tools");
+  const window = m.fit?.fits ? `up to ${fmtCtx(m.fit.max_context)}` : "does not fit";
+
+  card.innerHTML = `
+    <div class="model-card-head">
+      <span class="model-card-name"></span>
+      <span class="model-card-size">${gib(m.weights_bytes)}</span>
+    </div>
+    <p class="model-card-desc"></p>
+    <div class="model-card-row">
+      <button type="button" class="role-toggle" data-role="chat">Chat</button>
+      <button type="button" class="role-toggle" data-role="agentic">Agentic</button>
+      <span class="model-card-spacer"></span>
+      <span class="model-tag">${window}</span>
+      <button type="button" class="btn-ghost model-remove">Remove</button>
+    </div>`;
+  card.querySelector(".model-card-name").textContent = m.label;
+  card.querySelector(".model-card-desc").textContent =
+    m.description || [bits.join(" · "), m.size_label].filter(Boolean).join(" · ") || m.id;
+
+  card.querySelectorAll(".role-toggle").forEach((btn) => {
+    const role = btn.dataset.role;
+    const on = (m.roles || []).includes(role);
+    btn.classList.toggle("on", on);
+    // Ollama's answer, not a list we keep: no tools means no agentic, ever.
+    if (!m.can?.[role]) {
+      btn.disabled = true;
+      btn.title = role === "agentic"
+        ? `${m.label} has no tool support, so it cannot run the agent loop.`
+        : `${m.label} cannot serve ${role}.`;
+    }
+    btn.onclick = () => toggleModelRole(m, role, !on);
+  });
+  card.querySelector(".model-remove").onclick = () => removeModel(m);
+  return card;
+}
+
+async function toggleModelRole(m, role, want) {
+  const roles = new Set(m.roles || []);
+  if (want) roles.add(role); else roles.delete(role);
+  try {
+    await api("/api/models/roles", {
+      method: "POST",
+      body: JSON.stringify({ model: m.id, roles: [...roles] }),
+    });
+  } catch (e) {
+    setStatus(String(e.message || e));
+    return;
+  }
+  await loadModelRegistry();
+  renderModelsPanel();
+  syncModelPicker();
+}
+
+async function removeModel(m) {
+  const ok = await confirmAction({
+    title: `Remove ${m.label}?`,
+    body: `This deletes ${gib(m.weights_bytes)} of weights from Ollama. It can be downloaded again.`,
+    ok: "Remove",
+  });
+  if (!ok) return;
+  try {
+    await api("/api/models/delete", { method: "POST", body: JSON.stringify({ model: m.id }) });
+  } catch (e) {
+    setStatus(String(e.message || e));
+    return;
+  }
+  await loadModelRegistry();
+  renderModelsPanel();
+  syncModelPicker();
+}
+
+/** Stream a pull, then let the picker offer it without a reload. */
+async function installModel(tag, card) {
+  const btn = card?.querySelector(".model-install");
+  const bar = card?.querySelector(".model-progress");
+  const fill = bar?.querySelector("div");
+  if (btn) { btn.disabled = true; btn.textContent = "Installing…"; }
+  if (bar) bar.hidden = false;
+  try {
+    const res = await fetch("/api/models/pull", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: tag }),
+    });
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        let ev;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch (_) { continue; }
+        if (ev.type === "progress") {
+          if (btn) btn.textContent = ev.pct == null ? (ev.status || "Installing…") : `${ev.pct}%`;
+          if (fill && ev.pct != null) fill.style.width = `${ev.pct}%`;
+        } else if (ev.type === "error") {
+          throw new Error(ev.message || "Install failed");
+        } else if (ev.type === "done") {
+          if (btn) btn.textContent = "Installed";
+        }
+      }
+    }
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Retry"; }
+    setStatus(String(e.message || e));
+    return;
+  }
+  await loadModelRegistry();
+  renderModelsPanel();
+  syncModelPicker();
+}
+
+function renderModelsPanel() {
+  const reg = state.registry;
+  if (!reg) return;
+  renderHardware(reg.hardware);
+
+  const host = $("#installedModels");
+  if (host) {
+    host.innerHTML = "";
+    (reg.installed || []).filter((m) => !m.utility).forEach((m) => host.appendChild(installedCard(m)));
+  }
+
+}
+
+async function refreshModelsPanel() {
+  try {
+    state.registry = await api("/api/models");
+  } catch (_) {
+    return;
+  }
+  (state.registry.installed || []).forEach((m) => { state.modelsById[m.id] = m; });
+  renderModelsPanel();
+}
+
+// ── Model library ──────────────────────────────────────────────────────────
+//
+// A screen rather than a pane. Two sources scroll the same way behind one
+// cursor the server hands back, so nothing here knows that Ollama pages by
+// offset and Hugging Face by an opaque token.
+
+const _lib = {
+  source: "ollama",
+  query: "",
+  sort: "popular",
+  band: "",
+  fits: false,
+  cursor: null,
+  loading: false,
+  done: false,
+  count: 0,
+};
+
+let _libObserver = null;
+
+function fmtCount(n) {
+  const v = Number(n || 0);
+  if (v >= 1e9) return `${(v / 1e9).toFixed(1)}B`;
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+  return `${v}`;
+}
+
+/** One library row. Shares the install hooks with the sidebar's catalog card
+ *  so a pull drives either one without a second copy of the streaming code. */
+function libraryCard(entry) {
+  const card = document.createElement("article");
+  card.className = "lib-card" + (entry.installed ? " is-installed" : "");
+
+  const marks = [];
+  if (entry.capabilities.tools) marks.push("tools");
+  if (entry.capabilities.vision) marks.push("vision");
+  if (entry.capabilities.thinking) marks.push("thinking");
+
+  const stats = [
+    entry.downloads ? `${fmtCount(entry.downloads)} pulls` : "",
+    entry.likes ? `${fmtCount(entry.likes)} likes` : "",
+    entry.variant_count ? `${entry.variant_count} versions` : "",
+  ].filter(Boolean);
+
+  card.innerHTML = `
+    <div class="lib-card-head">
+      <span class="lib-card-name"></span>
+      <span class="lib-card-size"></span>
+    </div>
+    <div class="lib-card-by"></div>
+    <p class="lib-card-desc"></p>
+    <div class="lib-card-marks">${marks.map((m) => `<span class="lib-mark">${m}</span>`).join("")}</div>
+    <ul class="lib-card-warns"></ul>
+    <div class="lib-card-foot">
+      <span class="lib-card-stats">${stats.join(" · ")}</span>
+      <span class="model-card-spacer"></span>
+      <button type="button" class="btn-ghost model-install">${entry.installed ? "Add version" : "Choose version"}</button>
+    </div>
+    <div class="model-progress" hidden><div></div></div>`;
+
+  card.querySelector(".lib-card-name").textContent = entry.name;
+  card.querySelector(".lib-card-by").textContent =
+    entry.source === "huggingface" ? entry.publisher : "ollama.com/library";
+  card.querySelector(".lib-card-desc").textContent = entry.description || "GGUF weights";
+
+  // The head answers whichever question the card raises: which version you
+  // already have, or which sizes you could pick from.
+  const head = card.querySelector(".lib-card-size");
+  const here = entry.installed_variants || [];
+  if (here.length) {
+    head.classList.add("is-here");
+    head.textContent = `✓ ${here.slice(0, 3).join(", ")}${here.length > 3 ? "…" : ""}`;
+    head.title = `Installed: ${here.join(", ")}`;
+  } else {
+    // A family can carry a dozen sizes and the name matters more than all of
+    // them, so the head shows the first few and the picker shows the rest.
+    const sizes = (entry.size_label || "").split(", ").filter(Boolean);
+    head.textContent = sizes.length > 4 ? `${sizes.slice(0, 4).join(", ")}…` : sizes.join(", ");
+  }
+  card.querySelector(".lib-card-name").title = entry.tag;
+
+  const warns = card.querySelector(".lib-card-warns");
+  // The whole point of opening this up: say what is wrong before the download,
+  // not after. Fit is a warning too, since a model that does not fit still runs.
+  const lines = [...(entry.warnings || [])];
+  if (entry.fits === false) {
+    lines.push("Larger than this machine can hold. It would run from system RAM slowly.");
+  }
+  lines.forEach((text) => {
+    const li = document.createElement("li");
+    li.textContent = text;
+    warns.appendChild(li);
+  });
+  warns.hidden = !lines.length;
+
+  // Never disabled: a model you have is one you might want another size of.
+  card.querySelector(".model-install").onclick = () => pickVariant(entry, card);
+  return card;
+}
+
+/** Ollama tags and Hugging Face quantizations are the same question asked
+ *  twice, so one dialog asks it: which version of this, and does it fit. */
+async function pickVariant(entry, card) {
+  const dlg = $("#variantDialog");
+  const list = $("#variantList");
+  const note = $("#variantNote");
+  $("#variantTitle").textContent = entry.name;
+  note.textContent = "Reading versions…";
+  list.innerHTML = "";
+  dlg.showModal();
+
+  let data;
+  try {
+    data = await api(`/api/library/variants?source=${entry.source}&id=${encodeURIComponent(entry.id)}`);
+  } catch (e) {
+    note.textContent = String(e.message || e);
+    return;
+  }
+  const best = data.variants.find((v) => v.recommended);
+  note.textContent = [
+    best ? `★ ${best.label} is the best version this machine can hold.`
+         : "None of these fit in VRAM, so any of them would run from system RAM slowly.",
+    ...(data.notes || []),
+  ].join(" ");
+
+  if (!data.variants.length) {
+    note.textContent = "Nothing installable in this repository.";
+    return;
+  }
+  data.variants.forEach((v) => {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "variant-row" + (v.fits ? " fits" : "") + (v.installed ? " is-installed" : "")
+      + (v.recommended ? " is-best" : "");
+    const bits = [
+      v.weights_bytes ? gib(v.weights_bytes) : "size unknown",
+      v.context_length ? fmtCtx(v.context_length) : "",
+      v.parts > 1 ? `${v.parts} files` : "",
+      v.installed ? "installed" : (v.fits ? "fits" : "too big for VRAM"),
+    ].filter(Boolean);
+    row.innerHTML = `<span class="variant-star"></span>
+      <span class="variant-label"></span><span class="variant-meta"></span>`;
+    row.querySelector(".variant-star").textContent = v.recommended ? "★" : "";
+    row.querySelector(".variant-label").textContent = v.label;
+    row.querySelector(".variant-meta").textContent =
+      (v.recommended ? "best that fits · " : "") + bits.join(" · ");
+    row.disabled = !!v.installed;
+    row.onclick = async () => {
+      dlg.close();
+      const ok = await confirmAction({
+        title: `Install ${v.tag}?`,
+        body: `${v.weights_bytes ? gib(v.weights_bytes) : "Unknown size"} download.` +
+              (v.fits ? "" : " It is larger than this machine can hold, so it would run from system RAM slowly.") +
+              ((entry.warnings || []).length ? ` ${entry.warnings[0]}` : ""),
+        ok: "Install",
+      });
+      if (!ok) return;
+      await installModel(v.tag, card);
+      await refreshModelsPanel();
+    };
+    list.appendChild(row);
+  });
+}
+
+async function libraryLoad({ reset = false } = {}) {
+  if (_lib.loading) return;
+  if (reset) {
+    _lib.cursor = null;
+    _lib.done = false;
+    _lib.count = 0;
+    $("#libraryGrid").innerHTML = "";
+  }
+  if (_lib.done) return;
+  _lib.loading = true;
+  const foot = $("#libraryFoot");
+  foot.textContent = "Loading…";
+  const params = new URLSearchParams({
+    source: _lib.source,
+    q: _lib.query,
+    sort: _lib.sort,
+    band: _lib.band,
+    fits: _lib.fits ? "1" : "0",
+  });
+  if (_lib.cursor) params.set("cursor", _lib.cursor);
+  let page;
+  try {
+    page = await api(`/api/library?${params}`);
+  } catch (e) {
+    foot.textContent = String(e.message || e);
+    _lib.loading = false;
+    return;
+  }
+  const grid = $("#libraryGrid");
+  page.items.forEach((entry) => grid.appendChild(libraryCard(entry)));
+  _lib.count += page.items.length;
+  _lib.cursor = page.next;
+  _lib.done = !page.next;
+  _lib.loading = false;
+  $("#libraryCount").textContent = page.total
+    ? `${_lib.count} of ${page.total}`
+    : `${_lib.count} shown`;
+  foot.textContent = _lib.done
+    ? (_lib.count ? "That is everything." : "Nothing matched.")
+    : "";
+  // A page that filtered down to almost nothing can leave the grid too short
+  // to scroll, which would strand the loader with no event to wake it.
+  const scroller = $("#libraryScroll");
+  if (!_lib.done && scroller.scrollHeight <= scroller.clientHeight) {
+    setTimeout(() => libraryLoad(), 0);
+  }
+}
+
+function openLibrary() {
+  $("#libraryScreen").hidden = false;
+  document.body.classList.add("library-open");
+  $("#librarySearch").focus();
+  libraryLoad({ reset: true });
+  if (!_libObserver) {
+    // Watched against the scroller, not the window. The sentinel sits inside
+    // the scrolling box, so it leaves the view once a page has rendered and
+    // comes back when the reader reaches the end of it.
+    _libObserver = new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting)) libraryLoad();
+    }, { root: $("#libraryScroll"), rootMargin: "400px" });
+    _libObserver.observe($("#libraryFoot"));
+  }
+}
+
+function closeLibrary() {
+  $("#libraryScreen").hidden = true;
+  document.body.classList.remove("library-open");
+  refreshModelsPanel();
+  syncModelPicker();
+}
+
+function wireLibrary() {
+  const open = $("#btnBrowseLibrary");
+  if (open) open.onclick = openLibrary;
+  const close = $("#btnCloseLibrary");
+  if (close) close.onclick = closeLibrary;
+
+  document.querySelectorAll(".library-source").forEach((btn) => {
+    btn.onclick = () => {
+      document.querySelectorAll(".library-source").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      _lib.source = btn.dataset.source;
+      libraryLoad({ reset: true });
+    };
+  });
+
+  const search = $("#librarySearch");
+  if (search) {
+    let t = null;
+    search.oninput = () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        _lib.query = search.value.trim();
+        libraryLoad({ reset: true });
+      }, 250);
+    };
+  }
+  const sort = $("#librarySort");
+  if (sort) sort.onchange = () => { _lib.sort = sort.value; libraryLoad({ reset: true }); };
+  const band = $("#libraryBand");
+  if (band) band.onchange = () => { _lib.band = band.value; libraryLoad({ reset: true }); };
+  const fits = $("#libraryFits");
+  if (fits) fits.onchange = () => { _lib.fits = fits.checked; libraryLoad({ reset: true }); };
+
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("#libraryScreen").hidden) closeLibrary();
+  });
+}

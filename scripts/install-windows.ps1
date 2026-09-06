@@ -217,33 +217,77 @@ function Has-Model([string[]]$Installed, [string]$Tag) {
     return $false
 }
 
-function Choose-Profile($Hardware, [string[]]$Installed) {
-    if ($Models -ne "Auto") { return $Models }
-    $fullDiskNeed = 0
-    if (-not (Has-Model $Installed "qwen2.5:0.5b")) { $fullDiskNeed += 1 }
-    if (-not (Has-Model $Installed "qwen3.8:27b")) { $fullDiskNeed += 19 }
-    if (-not (Has-Model $Installed "qwen3-coder:30b")) { $fullDiskNeed += 20 }
-    $diskCapable = ($Hardware.FreeGB -lt 0 -or $Hardware.FreeGB -ge $fullDiskNeed)
-    $memoryCapable = (($Hardware.VramGB -ge 18 -and $Hardware.RamGB -ge 24) -or $Hardware.RamGB -ge 48)
-    $fullCapable = ($diskCapable -and $memoryCapable)
-    if ((Has-Model $Installed "qwen3.8:27b") -and (Has-Model $Installed "qwen3-coder:30b")) {
-        $recommended = "Full"
-    } elseif ($fullCapable) {
-        $recommended = "Full"
-    } else {
-        $recommended = "Chat"
-    }
+function Get-InstallPlan($Python, [string[]]$Installed) {
+    # models.py needs only the standard library, so it runs before pip does.
+    # Keeping the catalog in one place stops this script drifting from the app.
+    try {
+        $raw = & $Python.Exe "$Root\models.py" "--plan" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $raw) { return ($raw -join "`n" | ConvertFrom-Json) }
+    } catch {}
+    return $null
+}
 
-    if ($NonInteractive) { return $recommended }
+function Show-Choice([int]$Number, [string]$Title, $Choice, [string[]]$Installed) {
+    $gb = [math]::Round([double]$Choice.download_bytes / 1GB, 1)
+    $detail = if ($Choice.missing.Count -gt 0) { "$gb GB to download" } else { "already installed" }
+    Write-Host "  $Number. $Title ($detail)"
+    if ($Choice.note) { Write-Host "     $($Choice.note)" }
+    foreach ($tag in $Choice.tags) {
+        $mark = if (Has-Model $Installed $tag) { "have" } else { "get " }
+        Write-Host "       [$mark] $tag"
+    }
+}
+
+function Read-CustomTags($Python, $Plan) {
     Write-Host ""
-    Write-Host "Model profile" -ForegroundColor Yellow
-    Write-Host "  1. Chat - Qwen3.8 27B + title model (about 19 GB)"
-    Write-Host "  2. Full - Chat + Qwen3-Coder 30B (about 38 GB)"
-    $defaultNumber = if ($recommended -eq "Full") { "2" } else { "1" }
-    $answer = Read-Host "Choose 1 or 2 [recommended: $defaultNumber]"
-    if ([string]::IsNullOrWhiteSpace($answer)) { return $recommended }
-    if ($answer -eq "2") { return "Full" }
-    return "Chat"
+    Write-Host "Browse models at $($Plan.library_url) and copy the tag, for example qwen3:8b."
+    Write-Host "Enter one tag per line. Blank line when done."
+    $tags = New-Object System.Collections.Generic.List[string]
+    while ($true) {
+        $raw = (Read-Host "  tag").Trim()
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            if ($tags.Count -gt 0) { break }
+            Write-Host "     At least one model is needed."
+            continue
+        }
+        # Checked against Ollama's registry before anything is downloaded.
+        $size = & $Python.Exe -c "import sys, models; sys.stdout.write(str(models.manifest_size(sys.argv[1])))" $raw 2>$null
+        if (-not $size -or [int]$size -le 0) {
+            Write-Host "     Ollama has no model called $raw. Check the tag and try again."
+            continue
+        }
+        $gb = [math]::Round([double]$size / 1GB, 1)
+        Write-Host "     $raw found, $gb GB."
+        $tags.Add($raw) | Out-Null
+    }
+    return $tags.ToArray()
+}
+
+function Choose-Models($Python, $Plan, [string[]]$Installed) {
+    if ($Models -eq "Chat") { return @($Plan.recommended.tags) }
+    if ($Models -eq "Full") { return @($Plan.default.tags) }
+
+    Write-Host ""
+    Write-Host "Which models?" -ForegroundColor Yellow
+    Show-Choice 1 "Default" $Plan.default $Installed
+    Write-Host ""
+    Show-Choice 2 "Recommended" $Plan.recommended $Installed
+    Write-Host ""
+    Write-Host "  3. Type your own"
+    Write-Host "     Any tag from $($Plan.library_url). Checked before anything downloads."
+    Write-Host ""
+
+    # Recommended is sized for this machine; when it already is the tuned pair
+    # the two choices are the same thing.
+    $default = if ($Plan.same) { "1" } else { "2" }
+    if ($NonInteractive) { $answer = "" } else { $answer = Read-Host "Choose 1, 2 or 3 [recommended: $default]" }
+    if ([string]::IsNullOrWhiteSpace($answer)) { $answer = $default }
+
+    switch ($answer) {
+        "1" { return @($Plan.default.tags) }
+        "3" { return @(Read-CustomTags $Python $Plan) }
+        default { return @($Plan.recommended.tags) }
+    }
 }
 
 function Set-OllamaEnvironment([string]$Ollama) {
@@ -332,41 +376,52 @@ try {
     } else {
         Write-Host "Existing Ollama models: none detected"
     }
-    $modelProfile = Choose-Profile $hardware $installed
-    $profileModels = @("qwen2.5:0.5b", "qwen3.8:27b")
-    if ($modelProfile -eq "Full") { $profileModels += "qwen3-coder:30b" }
-    $missingModels = @($profileModels | Where-Object { -not (Has-Model $installed $_) })
-    $requiredDisk = 0
-    foreach ($tag in $missingModels) {
-        if ($tag -eq "qwen2.5:0.5b") { $requiredDisk += 1 }
-        elseif ($tag -eq "qwen3.8:27b") { $requiredDisk += 19 }
-        elseif ($tag -eq "qwen3-coder:30b") { $requiredDisk += 20 }
+    $plan = Get-InstallPlan $python $installed
+    $chosen = @()
+    if ($SkipModels) {
+        Write-Host "Skipping model downloads."
+    } elseif (-not $plan) {
+        Write-Warning "Could not read the model catalog; falling back to the default pair."
+        $chosen = @("qwen2.5:0.5b", "qwen3.8:27b", "qwen3-coder:30b")
+    } else {
+        $chosen = Choose-Models $python $plan $installed
     }
+
+    $missingModels = @($chosen | Where-Object { -not (Has-Model $installed $_) })
     if ($missingModels.Count -gt 0) {
         Write-Host "Models to download: $($missingModels -join ', ')"
-    } else {
-        Write-Host "Models to download: none (all profile models will be reused)"
+    } elseif (-not $SkipModels) {
+        Write-Host "Models to download: none (everything chosen is already here)"
     }
+    # Sizes come from Ollama's registry, so the disk check is exact rather than
+    # a table of numbers that goes stale.
+    $requiredBytes = 0
+    foreach ($tag in $missingModels) {
+        $size = & $python.Exe -c "import sys, models; sys.stdout.write(str(models.manifest_size(sys.argv[1])))" $tag 2>$null
+        if ($size) { $requiredBytes += [double]$size }
+    }
+    $requiredDisk = [math]::Round($requiredBytes / 1GB, 1)
     if (-not $SkipModels -and $requiredDisk -gt 0 -and $hardware.FreeGB -ge 0 -and $hardware.FreeGB -lt $requiredDisk) {
-        Stop-Setup "$modelProfile setup needs roughly $requiredDisk GB free on this drive; only $($hardware.FreeGB) GB is available."
+        Stop-Setup "That choice needs roughly $requiredDisk GB free on this drive; only $($hardware.FreeGB) GB is available."
     }
-    if ($hardware.RamGB -lt 24 -and $hardware.VramGB -lt 16) {
-        Write-Warning "Qwen3.8 27B may be extremely slow or fail on this PC. Aether can be installed, but the model needs substantial RAM or VRAM."
+    # Warn on the choice, not on a particular model: the user picked something
+    # the plan did not size for this machine.
+    $overrode = $plan -and (-not $plan.same) -and
+                (@(Compare-Object $chosen @($plan.default.tags) -SyncWindow 0).Count -eq 0)
+    if (-not $SkipModels -and $overrode) {
+        Write-Warning "That is larger than this PC was sized for and may be very slow. Recommended installs $($plan.recommended.tags -join ', ') instead."
         if (-not $NonInteractive) {
             $continue = Read-Host "Continue anyway? [y/N]"
             if ($continue -notmatch "^(y|yes)$") { Stop-Setup "Setup cancelled before downloading model weights." }
         }
     }
-    Write-Host "Selected profile: $modelProfile"
 
     Write-Step "Creating Aether environment and installing models"
     $setupArgs = @($python.Prefix) + @((Join-Path $Root "setup.py"))
     if ($SkipModels) {
         $setupArgs += "--skip-models"
-    } elseif ($modelProfile -eq "Full") {
-        $setupArgs += @("--models", "all")
     } else {
-        $setupArgs += @("--models", "chat")
+        $setupArgs += @("--tags") + $chosen
     }
     & $python.Exe @setupArgs
     if ($LASTEXITCODE -ne 0) { Stop-Setup "Aether's Python setup failed (exit $LASTEXITCODE)." }

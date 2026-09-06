@@ -31,3 +31,6 @@ dist/
 Thumbs.db
 desktop.ini
 
+
+# Local agent tooling
+.claude/

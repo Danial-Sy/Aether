@@ -1,6 +1,6 @@
 {
   "name": "Aether",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "launch": "Aether.bat",
   "launch_linux": "./aether.sh",
   "desktop_shortcut": "%USERPROFILE%\\Desktop\\Aether.lnk",
@@ -8,20 +8,33 @@
   "runtime": "native WebView2 window (pywebview) \u2014 localhost only, no browser UI",
   "url_internal": "http://127.0.0.1:7878",
   "models": {
-    "chat": "qwen3.8:27b",
-    "reasoning": "qwen3.8:27b",
-    "agentic": "qwen3.8:27b",
-    "agentic_fast": "qwen3-coder:30b",
-    "computer_use": "qwen3.8:27b"
+    "note": "Any Ollama model works. These are the defaults a fresh install starts with; the installer suggests others when the hardware calls for it, and models can be added or removed from inside Aether. Capabilities are read from Ollama's /api/show, not configured here.",
+    "roles": {
+      "chat": "any model",
+      "reasoning": "the chat model, offered when it reports a thinking mode",
+      "agentic": "any model that reports tool calling",
+      "computer_use": "an agentic model that reports vision"
+    },
+    "defaults": {
+      "chat": "qwen3.8:27b",
+      "agentic": "qwen3-coder:30b",
+      "vision": "qwen3.8:27b",
+      "titles": "qwen2.5:0.5b"
+    },
+    "catalog": "catalog.json",
+    "library": "https://ollama.com/library"
   },
   "context": {
-    "chat_default": 131072,
-    "reasoning_default": 65536,
-    "coder_default": 131072,
-    "coder_native_max": 262144,
+    "note": "The window belongs to the role, not the model, and a model can override it. Both are clamped to the model's native window and to what the card can hold.",
+    "role_defaults": {
+      "chat": 32768,
+      "reasoning": 32768,
+      "agentic": 65536
+    },
+    "reasoning_ceiling": 131072,
+    "reasoning_ceiling_note": "Thinking fills KV fast enough that a model's native window is not a safe limit for it.",
     "yarn_1m": false,
-    "yarn_note": "Qwen3-Coder supports YaRN to 1M in theory, but Ollama does not expose YaRN rope scaling. 1M is not practical on a 3090 Ti (24GB); use llama.cpp directly if you ever need it on much larger memory.",
-    "agent_default": 131072
+    "yarn_note": "Qwen3-Coder supports YaRN to 1M in theory, but Ollama does not expose YaRN rope scaling. 1M is not practical on a 3090 Ti (24GB); use llama.cpp directly if you ever need it on much larger memory."
   },
   "ollama_tuning": {
     "OLLAMA_KV_CACHE_TYPE": "q8_0",

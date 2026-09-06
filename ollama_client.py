@@ -14,7 +14,8 @@ from typing import Any, AsyncIterator
 
 import httpx
 
-from config import MODELS, OLLAMA_EXE, OLLAMA_HOST, OLLAMA_MODELS
+from config import OLLAMA_EXE, OLLAMA_HOST, OLLAMA_MODELS
+from models import CTX_BUCKETS as buckets
 
 _loaded_model: str | None = None
 
@@ -246,9 +247,11 @@ def unload_all_models_sync() -> list[str]:
     return freed
 
 
-async def ensure_model_loaded(key: str) -> dict:
+async def ensure_model_loaded(model_id: str, meta: dict | None = None) -> dict:
     global _loaded_model
-    meta = MODELS[key]
+    meta = dict(meta or {})
+    meta.setdefault("id", model_id)
+    meta.setdefault("keep_alive", "30m")
     mid = meta["id"]
     if not await model_ready(mid):
         raise RuntimeError(f"Model not installed: {mid}")
@@ -259,9 +262,10 @@ async def ensure_model_loaded(key: str) -> dict:
     return meta
 
 
-async def force_load_model(key: str, *, num_ctx: int = 2048, keep_alive: str | None = None) -> dict:
+async def force_load_model(model_id: str, *, meta: dict | None = None, num_ctx: int = 2048,
+                           keep_alive: str | None = None) -> dict:
     """Actually pull weights into VRAM with a 1-token generate (ensure_model_loaded alone does not)."""
-    meta = await ensure_model_loaded(key)
+    meta = await ensure_model_loaded(model_id, meta=meta)
     mid = meta["id"]
     ka = keep_alive or meta.get("keep_alive") or "30m"
     payload = {
@@ -369,7 +373,6 @@ def effective_num_ctx(
     # with "no user query found in messages"; overshooting only costs some KV.
     padded = int(int(estimated_prompt_tokens) * 1.15) + 256
     need = max(floor, padded + int(reply_headroom))
-    buckets = (2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144)
     limit = max(floor, int(ctx_limit))
     for b in buckets:
         if need <= b:
@@ -390,7 +393,6 @@ def model_options(meta: dict, num_ctx: int | None = None) -> dict:
 
 def _grow_num_ctx(options: dict) -> dict | None:
     """Next KV bucket up, or None when already at the ceiling."""
-    buckets = (2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 262144)
     cur = int((options or {}).get("num_ctx") or 0)
     for b in buckets:
         if b > cur:
@@ -449,13 +451,19 @@ async def stream_chat(
     # If the KV window was still sized too small, Ollama truncates the prompt and
     # 500s. Nothing has been yielded at that point, so growing num_ctx and
     # retrying once is safe and turns a dead run into a slower but working one.
-    for attempt in range(2):
+    for attempt in range(3):
         async with httpx.AsyncClient(timeout=None) as client:
             async with client.stream("POST", f"{OLLAMA_HOST}/api/chat", json=payload) as resp:
                 if resp.status_code >= 400:
                     detail = (await resp.aread()).decode("utf-8", "replace")[:400]
+                    # A stale profile can still ask a model to think. Ollama says
+                    # so explicitly, and the request is fine without it. Popping
+                    # the key is what stops this retrying twice.
+                    if "does not support thinking" in detail and "think" in payload:
+                        payload.pop("think", None)
+                        continue
                     grew = _grow_num_ctx(payload.get("options") or {})
-                    if attempt == 0 and grew:
+                    if attempt < 2 and grew:
                         payload["options"] = grew
                         continue
                     raise RuntimeError(

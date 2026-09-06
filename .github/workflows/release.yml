@@ -50,7 +50,7 @@ jobs:
       - name: Test setup model detection
         run: python -m unittest discover -s tests -p test_setup.py -v
       - name: Compile Windows entry-point modules
-        run: python -m py_compile setup.py config.py desktop.py ollama_client.py
+        run: python -m py_compile setup.py update.py config.py desktop.py ollama_client.py
 
   release:
     needs: [validate, validate-windows-installer]

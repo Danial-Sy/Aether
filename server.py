@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,7 +28,10 @@ import ollama_client as oc
 import search_router as sr
 import search_web
 import storage as st
-from config import COMPACT_PROMPT, MODELS, ROOT, SYSTEM_PROMPTS, TITLE_PROMPT, TITLE_MODEL_ID, UPLOADS, VERSION
+import config
+import models as reg
+import library as lib
+from config import COMPACT_PROMPT, ROOT, TITLE_PROMPT, UPLOADS, VERSION
 from config import effort_for as cfg_effort_for
 import computer_overlay
 import memory_router
@@ -123,8 +127,11 @@ class SendMessage(BaseModel):
     content: str
     reasoning: bool | None = None
     model_key: str | None = None
-    # "agent" | "coder". Both are real model keys; one runs the whole job.
+    # The model id that runs the whole job when this is an agentic turn.
     agent_model: str | None = None
+    # Which tab sent this. One model can serve both roles, so its id alone
+    # cannot say whether the turn is agentic.
+    mode: str | None = None
     effort: str | None = None
     computer_use: bool = False
     think: bool | None = None
@@ -159,26 +166,29 @@ _warm_state: dict = {
 }
 _warm_task: asyncio.Task | None = None
 _active_gens: dict[str, asyncio.Task] = {}
-WARM_ORDER = ("general", "reasoning", "agent", "coder")
-# Keys that drive the tool loop. "coder" is faster but blind, so computer use
-# always routes to "agent".
-AGENTIC_KEYS = ("agent", "coder")
-VISION_AGENT_KEY = "agent"
+def _registry() -> tuple[dict, dict]:
+    settings = st.load_settings()
+    return settings, reg.installed(settings)
 
 
-async def _warm_one(key: str, *, keep: bool = True) -> None:
-    meta = MODELS[key]
-    _warm_state["label"] = meta.get("label") or key
+def _meta(model_id: str, role: str, settings: dict | None = None) -> dict:
+    return reg.resolve(model_id, role, settings if settings is not None else st.load_settings())
+
+
+async def _warm_one(model_id: str, role: str = "chat", *, keep: bool = True) -> None:
+    meta = _meta(model_id, role)
+    _warm_state["label"] = meta.get("label") or model_id
     _warm_state["model"] = meta.get("id")
-    await oc.force_load_model(key, num_ctx=2048, keep_alive=(meta.get("keep_alive") or "30m") if keep else "0")
+    await oc.force_load_model(model_id, meta=meta, num_ctx=2048,
+                              keep_alive=(meta.get("keep_alive") or "30m") if keep else "0")
 
 
 async def _warm_all_models() -> None:
     """Warm the default chat model into VRAM and verify it is resident before opening the UI."""
     if _warm_event.is_set() and _warm_state.get("status") == "ready":
         # Re-verify: a stale "ready" from a previous process must not skip the load
-        mid = MODELS["general"]["id"]
-        if await oc.is_model_resident(mid):
+        mid = reg.active("chat") or ""
+        if mid and await oc.is_model_resident(mid):
             return
         _warm_event.clear()
     _warm_state["status"] = "warming"
@@ -186,8 +196,10 @@ async def _warm_all_models() -> None:
     _warm_state["total"] = 1
     _warm_state["progress"] = 1
     try:
-        await _warm_one("general", keep=True)
-        mid = MODELS["general"]["id"]
+        mid = reg.active("chat")
+        if not mid:
+            raise RuntimeError("No chat model is installed")
+        await _warm_one(mid, "chat", keep=True)
         # Poll until Ollama reports the model resident (or timeout)
         for _ in range(40):
             if await oc.is_model_resident(mid):
@@ -195,10 +207,10 @@ async def _warm_all_models() -> None:
             await asyncio.sleep(0.25)
         if not await oc.is_model_resident(mid):
             # One more force load attempt
-            await _warm_one("general", keep=True)
+            await _warm_one(mid, "chat", keep=True)
         if await oc.is_model_resident(mid):
             _warm_state["status"] = "ready"
-            _warm_state["label"] = MODELS["general"]["label"]
+            _warm_state["label"] = _meta(mid, "chat").get("label")
             _warm_state["model"] = mid
         else:
             _warm_state["status"] = "error"
@@ -231,6 +243,10 @@ async def startup() -> None:
             st.new_project("AI Workspace", str(AI_ROOT), "Forge / models / tools")
         except Exception:
             pass
+    try:
+        await reg.refresh_registry()
+    except Exception:
+        pass
     _ensure_warm_task()
 
 
@@ -303,10 +319,9 @@ async def warmup_status():
     try:
         running = await oc.list_running_models()
         names = {(m.get("name") or m.get("model") or "") for m in running}
-        for key, meta in MODELS.items():
-            mid = meta.get("id") or ""
+        for mid in reg.installed():
             if any(n == mid or n.startswith(mid) for n in names):
-                resident.append(key)
+                resident.append(mid)
     except Exception:
         resident = []
     return {
@@ -325,11 +340,15 @@ async def warmup_status():
 @app.post("/api/warmup/model/{key}")
 async def warmup_model(key: str):
     """Warm a single model (used when switching). Leaves that model loaded."""
-    if key not in MODELS:
+    settings, registry = _registry()
+    model_id = key
+    role = "agentic" if key in reg.models_for("agentic", settings, registry) else "chat"
+    if not model_id or model_id not in registry:
         raise HTTPException(404, "Unknown model")
     try:
-        await _warm_one(key, keep=True)
-        return {"ok": True, "key": key, "model": MODELS[key]["id"], "label": MODELS[key]["label"]}
+        await _warm_one(model_id, role, keep=True)
+        meta = _meta(model_id, role, settings)
+        return {"ok": True, "key": key, "model": model_id, "label": meta.get("label")}
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -406,22 +425,256 @@ async def health():
         names = {m["name"] for m in installed}
     except Exception as e:
         return {"ok": False, "error": str(e), "models": []}
+    settings, registry = _registry()
     models = []
-    for key, meta in MODELS.items():
+    for model_id, profile in registry.items():
         models.append({
-            **meta,
-            "key": key,
-            "installed": any(meta["id"] == n or n.startswith(meta["id"]) for n in names),
+            **profile,
+            "key": model_id,
+            "installed": any(model_id == n or n.startswith(model_id) for n in names),
         })
-    from config import EFFORT, EFFORT_ORDER
-    # Ordered low→high so the UI can index the slider straight off this list.
-    levels = [{"key": k, **EFFORT[k]} for k in EFFORT_ORDER if k in EFFORT]
+    chat_id = reg.active("chat", settings, registry)
     return {
         "ok": True,
         "models": models,
-        "settings": st.load_settings(),
-        "effort_levels": levels,
+        "settings": settings,
+        "effort_levels": reg.effort_levels(registry.get(chat_id) or {}),
     }
+
+
+class ModelRolesIn(BaseModel):
+    model: str
+    roles: list[str] = Field(default_factory=list)
+
+
+class ModelTagIn(BaseModel):
+    model: str
+
+
+def _installed_view(settings: dict, registry: dict, budget: int) -> list[dict]:
+    assigned = reg.role_map(settings, registry)
+    active = {role: reg.active(role, settings, registry) for role in config.ROLES}
+    utility = reg.utility_models()
+    out = []
+    for model_id, profile in registry.items():
+        out.append({
+            **profile,
+            "roles": assigned.get(model_id) or [],
+            "can": {role: reg.can_serve(profile, role) for role in config.ROLES},
+            "active": {role: active.get(role) == model_id for role in config.ROLES},
+            "utility": model_id in utility,
+            "fit": reg.fit_report(profile, budget),
+            "effort_levels": reg.effort_levels(profile),
+            "thinking": reg.thinking_summary(profile),
+        })
+    out.sort(key=lambda m: m["label"].lower())
+    return out
+
+
+@app.get("/api/models")
+async def api_models():
+    """What is installed and what this machine can hold. Finding a model to add
+    is the library screen's job, so nothing here describes one that is not."""
+    settings, registry = _registry()
+    hw = reg.hardware()
+    budget = int(hw.get("usable_bytes") or 0)
+    return {
+        "hardware": hw,
+        "installed": _installed_view(settings, registry, budget),
+        "roles": {role: reg.models_for(role, settings, registry) for role in config.ROLES},
+        "active": {
+            **{role: reg.active(role, settings, registry) for role in config.ROLES},
+            "vision": reg.vision_model(settings, registry),
+        },
+    }
+
+
+@app.post("/api/models/roles")
+async def api_model_roles(body: ModelRolesIn):
+    """Turn the Chat and Agentic toggles on or off for one model."""
+    settings, registry = _registry()
+    if body.model not in registry:
+        raise HTTPException(404, "That model is not installed.")
+    wanted = [r for r in ("chat", "agentic") if r in body.roles]
+    profile = registry[body.model]
+    for role in wanted:
+        if not reg.can_serve(profile, role):
+            raise HTTPException(
+                400, f"{profile.get('label') or body.model} cannot serve {role}: "
+                     "Ollama reports it has no tool support.")
+    stored = dict(settings.get("model_roles") or {})
+    current = reg.role_map(settings, registry)
+    # Aether with no chat model has nothing to talk to.
+    if "chat" not in wanted:
+        others = [m for m, roles in current.items() if "chat" in roles and m != body.model]
+        if not others:
+            raise HTTPException(409, "This is the only model assigned to Chat.")
+    stored[body.model] = wanted
+    saved = st.save_settings({"model_roles": stored})
+    registry = reg.installed(saved)
+    return {"ok": True, "model": body.model, "roles": wanted,
+            "roles_by_model": reg.role_map(saved, registry)}
+
+
+@app.post("/api/models/active")
+async def api_model_active(body: ModelRolesIn):
+    """Pick which assigned model a role runs on."""
+    settings, registry = _registry()
+    role = next((r for r in body.roles if r in config.ROLES), "chat")
+    if body.model not in reg.models_for(role, settings, registry):
+        raise HTTPException(400, f"That model is not assigned to {role}.")
+    active = dict(settings.get("model_active") or {})
+    active[role] = body.model
+    st.save_settings({"model_active": active})
+    return {"ok": True, "role": role, "model": body.model}
+
+
+@app.get("/api/library")
+async def api_library(source: str = "ollama", q: str = "", sort: str = "popular",
+                      cursor: str = "", band: str = "", fits: int = 0):
+    """One page of a remote library. Ollama's is held locally and pages by
+    offset; Hugging Face pages behind its own opaque cursor. The screen does
+    not need to know which, so both answer with items and a next."""
+    if source not in lib.SOURCES:
+        raise HTTPException(400, f"Unknown library {source!r}.")
+    settings, registry = _registry()
+    hw = reg.hardware()
+    try:
+        page = await lib.browse(
+            source, q, sort, cursor or None,
+            band=band, fits_only=bool(fits),
+            registry=registry, budget=int(hw.get("usable_bytes") or 0),
+        )
+    except Exception as e:
+        raise HTTPException(502, f"{source} did not answer: {e}")
+    return {**page, "sorts": list(lib.SORTS), "bands": list(lib.PARAM_BANDS)}
+
+
+@app.get("/api/library/variants")
+async def api_library_variants(source: str = "ollama", id: str = ""):
+    """Every installable version of one entry, with real sizes and what fits."""
+    if source not in lib.SOURCES:
+        raise HTTPException(400, f"Unknown library {source!r}.")
+    if not id.strip():
+        raise HTTPException(400, "Which model?")
+    hw = reg.hardware()
+    _, registry = _registry()
+    try:
+        found = await lib.variants(source, id.strip(), budget=int(hw.get("usable_bytes") or 0))
+    except Exception as e:
+        raise HTTPException(502, f"{source} did not answer: {e}")
+    for row in found["variants"]:
+        row["installed"] = row["tag"] in registry
+    return found
+
+
+@app.post("/api/models/verify")
+async def api_model_verify(body: ModelTagIn):
+    """Does this tag exist, and how big is it, before committing to a download."""
+    tag = reg.normalize_tag(body.model)
+    settings, registry = _registry()
+    if tag in registry or body.model in registry:
+        profile = registry.get(tag) or registry[body.model]
+        return {"ok": True, "installed": True, "model": profile["id"],
+                "bytes": profile.get("weights_bytes") or 0}
+    size = await reg.fetch_manifest_size(tag)
+    if not size:
+        if lib.is_hf_tag(tag):
+            raise HTTPException(404, f"Hugging Face has no GGUF called {body.model}. "
+                                     "The part after the colon is a quantization, "
+                                     "such as Q4_K_M, not a version.")
+        raise HTTPException(404, f"Ollama has no model called {body.model}.")
+    hw = reg.hardware()
+    return {
+        "ok": True,
+        "installed": False,
+        "model": tag,
+        "bytes": size,
+        "free_disk_bytes": hw["free_disk_bytes"],
+        "enough_disk": size < hw["free_disk_bytes"],
+        "fits_memory": (size + reg.RUNTIME_OVERHEAD) <= int(hw.get("usable_bytes") or 0),
+        "entry": reg.catalog_entry(tag),
+    }
+
+
+@app.post("/api/models/pull")
+async def api_model_pull(body: ModelTagIn):
+    """Stream an Ollama pull. Errors arrive inside a 200 stream, not as a status."""
+    tag = reg.normalize_tag(body.model)
+
+    async def event_stream():
+        seen_error = None
+        progress = reg.PullProgress()
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", f"{oc.OLLAMA_HOST}/api/pull",
+                                         json={"model": tag, "stream": True}) as resp:
+                    if resp.status_code >= 400:
+                        detail = (await resp.aread()).decode("utf-8", "replace")[:300]
+                        yield _sse({"type": "error", "message": detail.strip()})
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if chunk.get("error"):
+                            seen_error = chunk["error"]
+                            yield _sse({"type": "error", "message": seen_error})
+                            return
+                        yield _sse(progress.update(chunk))
+        except Exception as e:
+            yield _sse({"type": "error", "message": str(e)})
+            return
+        if seen_error:
+            return
+        # Profile it before saying it is ready, so the UI can show capabilities
+        # and the pickers can offer it immediately.
+        try:
+            await reg.refresh_registry()
+        except Exception:
+            pass
+        settings, registry = _registry()
+        profile = registry.get(tag) or {}
+        yield _sse({
+            "type": "done",
+            "model": tag,
+            "profile": profile,
+            "roles": (reg.role_map(settings, registry) or {}).get(tag) or [],
+        })
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.post("/api/models/delete")
+async def api_model_delete(body: ModelTagIn):
+    """Remove a model from Ollama. Refused while it is the only chat model."""
+    settings, registry = _registry()
+    tag = body.model if body.model in registry else reg.normalize_tag(body.model)
+    if tag not in registry:
+        raise HTTPException(404, "That model is not installed.")
+    assigned = reg.role_map(settings, registry)
+    if "chat" in (assigned.get(tag) or []):
+        others = [m for m, roles in assigned.items() if "chat" in roles and m != tag]
+        if not others:
+            raise HTTPException(409, "This is the only model assigned to Chat.")
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.request("DELETE", f"{oc.OLLAMA_HOST}/api/delete",
+                                        json={"model": tag})
+    except Exception as e:
+        raise HTTPException(502, f"Ollama did not respond: {e}")
+    if resp.status_code >= 400:
+        raise HTTPException(resp.status_code, resp.text[:300])
+    # Drop its assignments and any pick that pointed at it.
+    roles = {k: v for k, v in (settings.get("model_roles") or {}).items() if k != tag}
+    active = {k: v for k, v in (settings.get("model_active") or {}).items() if v != tag}
+    ctx = {k: v for k, v in (settings.get("model_context") or {}).items() if k != tag}
+    st.save_settings({"model_roles": roles, "model_active": active, "model_context": ctx})
+    await reg.refresh_registry()
+    return {"ok": True, "removed": tag}
 
 
 @app.get("/api/settings")
@@ -448,7 +701,7 @@ async def api_new_chat(body: ChatCreate):
     title = body.title or titles.get(mode, "New chat")
     chat = st.new_chat(mode=mode, title=title, project_id=body.project_id)
     if mode == "agentic":
-        chat["agent_model"] = _agent_model_choice(body.agent_model, DEFAULT_AGENT_KEY)
+        chat["model_id"] = _agent_model_choice(body.agent_model)
         chat = st.save_chat(chat)
     return chat
 
@@ -468,8 +721,8 @@ async def api_patch_chat(cid: str, body: ChatPatch):
         raise HTTPException(404)
     patch = body.model_dump(exclude_none=True)
     if "agent_model" in patch:
-        patch["agent_model"] = _agent_model_choice(
-            patch["agent_model"], chat.get("agent_model") or DEFAULT_AGENT_KEY
+        patch["model_id"] = _agent_model_choice(
+            patch.pop("agent_model"), chat.get("model_id")
         )
     chat.update(patch)
     chat = st.save_chat(chat)
@@ -488,44 +741,92 @@ async def api_delete_chat(cid: str):
     return {"ok": True}
 
 
-# One model runs the whole job. "hybrid" swapped models mid-run, which costs a
-# full unload and reload on a 24GB card. Legacy chats storing it are migrated.
-AGENT_MODEL_CHOICES = AGENTIC_KEYS
-# The MoE coder activates ~3B parameters per token, so it emits tool calls far
-# faster than the dense 27B. The 27B is selected explicitly when vision is needed.
-DEFAULT_AGENT_KEY = "coder"
+def _agent_model_choice(requested: str | None, fallback: str | None = None) -> str | None:
+    """Clamp an agentic selection to a model that is actually assigned to the role."""
+    settings, registry = _registry()
+    options = reg.models_for("agentic", settings, registry)
+    # "hybrid" swapped models mid-run, which costs a full unload and reload.
+    resolved = requested
+    if resolved in options:
+        return resolved
+    if fallback in options:
+        return fallback
+    return reg.active("agentic", settings, registry)
 
 
-def _agent_model_choice(requested: str | None, fallback: str) -> str:
-    """Clamp the UI's agentic selection to a real model key."""
-    if requested == "hybrid":
-        return DEFAULT_AGENT_KEY
-    return requested if requested in AGENT_MODEL_CHOICES else fallback
+def _is_known_model_key(key: str | None) -> bool:
+    if not key:
+        return False
+    return key in reg.installed()
+
+
+def _requested_role(body, chat: dict) -> str:
+    """Which tab this turn came from. The request has to say, because one model
+    can serve both roles and its id alone cannot tell them apart."""
+    mode = getattr(body, "mode", None)
+    if mode in ("code", "agentic", "computer"):
+        return "agentic"
+    if mode == "chat":
+        return "chat"
+    # A client that does not send it keeps whatever the chat already is.
+    return _role(chat)
+
+
+def _no_model_message(role: str) -> str:
+    if role == "agentic":
+        return ("No installed model can call tools, so agentic mode is unavailable. "
+                "Install a tool-capable model, or assign one to Agentic in Models.")
+    return "No model is assigned to chat. Install a model, or assign one in Models."
+
+
+def _role(chat: dict, reasoning: bool | None = None) -> str:
+    """Which job this chat is doing. Roles key the prompt, effort and window."""
+    if (chat.get("mode") or "chat") in ("code", "agentic", "computer"):
+        return "agentic"
+    use_r = chat.get("reasoning", False) if reasoning is None else reasoning
+    return "reasoning" if use_r else "chat"
 
 
 def _model_key(chat: dict, reasoning: bool | None = None, model_key: str | None = None) -> str:
-    if model_key and model_key in MODELS:
-        return model_key
-    mode = chat.get("mode") or "chat"
-    if mode in ("code", "agentic", "computer"):
-        # Computer use needs eyes; coder has none, so it always falls back to agent.
+    """The model id this chat runs on."""
+    settings, registry = _registry()
+    role = _role(chat, reasoning)
+    if model_key:
+        wanted = model_key
+
+        if wanted in reg.models_for(role, settings, registry):
+            return wanted
+    if role == "agentic":
         if chat.get("computer_use"):
-            return VISION_AGENT_KEY
-        sel = chat.get("agent_model")
-        # Chats saved before hybrid was removed still carry it; run them on the
-        # executor rather than silently promoting them to the slower dense model.
-        return sel if sel in AGENTIC_KEYS else DEFAULT_AGENT_KEY
-    use_r = chat.get("reasoning", False) if reasoning is None else reasoning
-    return "reasoning" if use_r else "general"
+            eyes = reg.vision_model(settings, registry)
+            if eyes:
+                return eyes
+        sel = chat.get("model_id") or chat.get("agent_model")
+        if sel in reg.models_for("agentic", settings, registry):
+            return sel
+        chosen = reg.active("agentic", settings, registry)
+        if chosen:
+            return chosen
+        # Nothing is assigned to the role. Falling back to the chat model is
+        # only honest if that model can call tools; otherwise the run would
+        # fail inside Ollama with nothing useful to show the user.
+        chat_model = reg.active("chat", settings, registry)
+        if chat_model and (registry.get(chat_model) or {}).get("tools"):
+            return chat_model
+        return ""
+    sel = chat.get("model_id")
+    if sel in reg.models_for(role, settings, registry):
+        return sel
+    return reg.active(role, settings, registry) or reg.active("chat", settings, registry) or ""
 
 
-def _resolve_effort(requested: str | None, model_key: str) -> str:
-    """Clamp a UI-supplied effort tier, falling back to the model's own default."""
+def _resolve_effort(requested: str | None, role: str) -> str:
+    """Clamp a UI-supplied effort tier, falling back to the role's own default."""
     from config import EFFORT
     tier = (requested or "").strip().lower()
     if tier in EFFORT:
         return tier
-    return cfg_effort_for(model_key)
+    return cfg_effort_for(role)
 
 
 def _apply_effort(meta: dict, opts: dict, effort: str | None = None) -> dict:
@@ -551,7 +852,7 @@ def _chat_has_images(chat: dict) -> bool:
 
 
 def _num_ctx_for(chat: dict, model_key: str, msgs: list[dict] | None = None) -> int:
-    limit = _ctx_limit(model_key)
+    limit = _ctx_limit(model_key, _role(chat))
     # Estimate what we will send this turn. Callers inside the agent loop pass the
     # prompt they already rendered rather than paying for a second full render.
     try:
@@ -570,7 +871,7 @@ def _num_ctx_for(chat: dict, model_key: str, msgs: list[dict] | None = None) -> 
     # Headroom must cover the full reply budget. Reserving less than num_predict
     # cuts generation off inside the thinking block, yielding no tool call.
     from config import EFFORT, DEFAULT_EFFORT
-    tier = chat.get("effort") or (MODELS.get(model_key) or {}).get("effort") or DEFAULT_EFFORT
+    tier = chat.get("effort") or cfg_effort_for(_role(chat)) or DEFAULT_EFFORT
     reply_budget = int((EFFORT.get(tier) or EFFORT[DEFAULT_EFFORT]).get("num_predict") or 0)
     headroom = max(headroom, reply_budget + 512)
     want = oc.effective_num_ctx(used, limit, reply_headroom=headroom, floor=floor)
@@ -589,17 +890,9 @@ def _num_ctx_for(chat: dict, model_key: str, msgs: list[dict] | None = None) -> 
     return val
 
 
-def _ctx_limit(key: str) -> int:
-    settings = st.load_settings()
-    override = {
-        "general": settings.get("chat_context"),
-        "reasoning": settings.get("reasoning_context"),
-        "agent": settings.get("agent_context"),
-        "coder": settings.get("coder_context"),
-    }.get(key)
-    meta = MODELS[key]
-    val = int(override or meta["context"])
-    return min(val, int(meta.get("context_max") or val))
+def _ctx_limit(model_id: str, role: str = "chat") -> int:
+    settings, registry = _registry()
+    return reg.context_limit(model_id, role, settings, registry.get(model_id) or {})
 
 
 # Replaying every tool result verbatim overruns num_ctx, and Ollama truncates the
@@ -704,7 +997,7 @@ def _advance_detail_horizon(chat: dict, model_key: str, msgs: list[dict] | None 
     Costs one pass over per-message estimates; the old replay floor re-rendered
     the entire prompt up to 200 times to make the same decision.
     """
-    limit = _ctx_limit(model_key)
+    limit = _ctx_limit(model_key, _role(chat))
     threshold = float(st.load_settings().get("auto_compact_at", 0.85))
     high = int(limit * threshold * 0.9)
     used = _estimate_chat_tokens(chat, model_key, msgs=msgs)
@@ -926,7 +1219,8 @@ def _build_messages(
     clarify_first: bool = False,
     tool_replay_limit: int | None = None,
 ) -> list[dict]:
-    sys = SYSTEM_PROMPTS[model_key]
+    chat_role = _role(chat)
+    sys = reg.system_prompt(chat_role, reg.installed().get(model_key) or {})
     mem = st.memory_as_prompt("global", chat.get("project_id"))
     if mem:
         sys += "\n\n# Memory\n" + mem
@@ -939,8 +1233,10 @@ def _build_messages(
     lib_block = ar.library_prompt_block(chat.get("file_library"))
     if lib_block:
         sys += "\n\n" + lib_block
-    if model_key in AGENTIC_KEYS:
-        sys += agent.tools_system_addon()
+    if chat_role == "agentic":
+        sys += agent.tools_system_addon(
+            agent.tool_defs_for(chat, _ctx_limit(model_key, chat_role))
+        )
         proj = st.get_project(chat["project_id"]) if chat.get("project_id") else None
         if proj:
             sys += f"\n\nActive project: {proj['name']}\nRoot: {proj['root']}\n{proj.get('description') or ''}"
@@ -1092,7 +1388,7 @@ def _build_messages(
             send_content = agent.CONTINUE_NUDGE + "\n\n" + send_content
         elif m.get("course_correct"):
             send_content = agent.COURSE_CORRECT_PREFIX + send_content
-        if role == "user" and model_key not in AGENTIC_KEYS:
+        if role == "user" and chat_role != "agentic":
             load_paths = m.get("load_files") or None
             if load_paths:
                 extra = _expand_attachments_for_chat_model(
@@ -1162,8 +1458,9 @@ def _estimate_chat_tokens(chat: dict, model_key: str, msgs: list[dict] | None = 
         msgs = _build_messages(chat, model_key)
     used = oc.estimate_messages_tokens(msgs)
     # The schema is sent beside messages and consumes the same KV context.
-    if model_key in AGENTIC_KEYS:
-        used += oc.estimate_tokens(json.dumps(agent.tool_defs_for(chat), ensure_ascii=False)) + 128
+    if _role(chat) == "agentic":
+        defs = agent.tool_defs_for(chat, _ctx_limit(model_key, "agentic"))
+        used += oc.estimate_tokens(json.dumps(defs, ensure_ascii=False)) + 128
     return int(used * _estimate_bias(chat, model_key))
 
 
@@ -1174,9 +1471,9 @@ async def _compact_chat(chat: dict, model_key: str, upto: int) -> str:
     the only thing that survives the boundary, and a weaker model produced a prose
     blob that dropped file paths and decisions the run still needed.
     """
-    key = model_key if model_key in MODELS else "general"
-    meta = await oc.ensure_model_loaded(key)
-    ctx = min(_ctx_limit(key), 32768)
+    key = model_key if model_key in reg.installed() else (reg.active("chat") or model_key)
+    meta = await oc.ensure_model_loaded(key, meta=_meta(key, config.COMPACT_MODEL_ROLE))
+    ctx = min(_ctx_limit(key, _role(chat)), 32768)
     transcript = []
     for m in (chat.get("messages") or [])[:upto]:
         if m.get("kind") == COMPACT_BOUNDARY_KIND:
@@ -1246,7 +1543,7 @@ async def _maybe_auto_compact(chat: dict, model_key: str, emit=None, msgs=None):
     settings = st.load_settings()
     threshold = float(settings.get("auto_compact_at", 0.85))
     keep = int(settings.get("compact_keep_recent", 10))
-    limit = _ctx_limit(model_key)
+    limit = _ctx_limit(model_key, _role(chat))
     did = False
 
     for _pass in range(4):
@@ -1310,17 +1607,28 @@ async def _maybe_auto_compact(chat: dict, model_key: str, emit=None, msgs=None):
     return chat, did
 
 
+# Ollama surfaces reasoning in its own `thinking` field for most models, but
+# some still emit it inline, and not every family spells the tag the same way.
+THINK_TAGS = ("think", "thinking", "reasoning")
+_THINK_CLOSED = re.compile(
+    r"<(" + "|".join(THINK_TAGS) + r")>(.*?)</\1>", re.DOTALL | re.IGNORECASE
+)
+_THINK_OPEN = re.compile(r"^\s*<(" + "|".join(THINK_TAGS) + r")>(.*)$", re.DOTALL | re.IGNORECASE)
+
+
 def _split_thinking(content: str) -> tuple[str, str]:
     think = ""
     body = content
-    m = re.search(r"<think>(.*?)</think>", content, re.DOTALL | re.IGNORECASE)
+    m = _THINK_CLOSED.search(content)
     if m:
-        think = m.group(1).strip()
+        think = m.group(2).strip()
         body = (content[: m.start()] + content[m.end() :]).strip()
     else:
-        m2 = re.match(r"<think>(.*)$", content, re.DOTALL | re.IGNORECASE)
-        if m2 and "</think>" not in content.lower():
-            think = m2.group(1).strip()
+        m2 = _THINK_OPEN.match(content)
+        # An unclosed tag means the reply was cut off mid-thought, so all of it
+        # is reasoning and none of it is an answer.
+        if m2 and f"</{m2.group(1).lower()}>" not in content.lower():
+            think = m2.group(2).strip()
             body = ""
     return body, think
 
@@ -1504,7 +1812,7 @@ async def _post_reply_jobs(cid: str, model_key: str) -> None:
             return
         await _maybe_auto_title(final)
         used = _estimate_chat_tokens(final, model_key)
-        limit = _ctx_limit(model_key)
+        limit = _ctx_limit(model_key, _role(final))
         over = used / max(limit, 1) >= float(st.load_settings().get("auto_compact_at", 0.85))
         if over and len(final.get("messages") or []) >= 3:
             await _maybe_auto_compact(final, model_key, None)
@@ -1525,7 +1833,7 @@ async def _heuristic_title(user_text: str) -> str:
 
 
 async def _maybe_auto_title(chat: dict) -> str | None:
-    """Title via tiny CPU model (qwen2.5:0.5b) so the 27B GPU model is never interrupted."""
+    """Title via the smallest installed model so the main GPU model is never interrupted."""
     if chat.get("title_auto") and not st.is_placeholder_title(chat.get("title")):
         return None
     msgs = chat.get("messages") or []
@@ -1534,11 +1842,12 @@ async def _maybe_auto_title(chat: dict) -> str | None:
     if not user or not asst:
         return None
     title = None
+    title_id = reg.title_model() or reg.active("chat")
     try:
         snippet = f"USER: {(user.get('content') or '')[:400]}\nASSISTANT: {(asst.get('content') or '')[:400]}"
         # num_gpu=0 means CPU only, so the resident chat model stays in VRAM
         raw = await oc.chat_once(
-            TITLE_MODEL_ID,
+            title_id,
             [
                 {"role": "system", "content": TITLE_PROMPT},
                 {"role": "user", "content": snippet},
@@ -1562,36 +1871,6 @@ async def _maybe_auto_title(chat: dict) -> str | None:
         chat["title_auto"] = True
         st.save_chat(chat)
         return title
-    return None
-    msgs = chat.get("messages") or []
-    user = next((m for m in msgs if m.get("role") == "user" and m.get("content")), None)
-    asst = next((m for m in reversed(msgs) if m.get("role") == "assistant" and m.get("content")), None)
-    if not user or not asst:
-        return None
-    try:
-        meta = await oc.ensure_model_loaded("general")
-        snippet = f"USER: {(user.get('content') or '')[:800]}\n\nASSISTANT: {(asst.get('content') or '')[:800]}"
-        raw = await oc.chat_once(
-            meta["id"],
-            [
-                {"role": "system", "content": TITLE_PROMPT},
-                {"role": "user", "content": snippet},
-            ],
-            options=oc.model_options(meta, 4096),
-            keep_alive="2m",
-        )
-        body, _ = _split_thinking(raw)
-        title = (body or raw).strip().splitlines()[0].strip().strip("\"'")
-        title = re.sub(r"^[Tt]itle:\s*", "", title).strip()
-        if len(title) > 60:
-            title = title[:57] + "..."
-        if title and len(title) >= 2:
-            chat["title"] = title
-            chat["title_auto"] = True
-            st.save_chat(chat)
-            return title
-    except Exception:
-        return None
     return None
 
 
@@ -1691,7 +1970,7 @@ def _prepare_user_message(body: SendMessage, chat: dict | None = None) -> dict:
             messages=(chat or {}).get("messages") or [],
             last_search_query=(chat or {}).get("last_search_query") or "",
             force_on=bool(body.web_search),
-            agentic=_model_key(chat or {}, model_key=body.model_key) in AGENTIC_KEYS,
+            agentic=_role(chat or {}) == "agentic",
         )
     if decision and decision.search and decision.query:
         try:
@@ -1721,17 +2000,18 @@ async def api_send(cid: str, body: SendMessage):
         raise HTTPException(404)
 
     # Model picker / computer-use toggle
-    if body.model_key in MODELS:
+    if _is_known_model_key(body.model_key):
         mk = body.model_key
-        if mk in AGENTIC_KEYS:
+        if _requested_role(body, chat) == "agentic":
             chat["mode"] = "agentic"
-            chat["agent_model"] = _agent_model_choice(body.agent_model, mk)
+            chat["model_id"] = _agent_model_choice(body.agent_model or mk)
             chat["computer_use"] = bool(body.computer_use)
             chat["reasoning"] = False
         else:
             chat["mode"] = "chat"
             chat["computer_use"] = False
-            chat["reasoning"] = mk == "reasoning"
+            chat["reasoning"] = bool(body.reasoning)
+            chat["model_id"] = mk
     else:
         if body.reasoning is not None and (chat.get("mode") or "chat") == "chat":
             chat["reasoning"] = body.reasoning
@@ -1772,7 +2052,7 @@ async def api_send(cid: str, body: SendMessage):
     model_key_early = _model_key(chat, model_key=body.model_key)
     if decision.read:
         user_msg["load_files"] = decision.paths
-        nudge = ar.format_read_nudge(decision, agentic=(model_key_early in AGENTIC_KEYS))
+        nudge = ar.format_read_nudge(decision, agentic=(_role(chat) == "agentic"))
         if nudge:
             user_msg["content"] = (user_msg.get("content") or "") + nudge
 
@@ -1821,6 +2101,8 @@ async def api_send(cid: str, body: SendMessage):
     st.ensure_message_ids(chat)
     st.save_chat(chat)
     model_key = _model_key(chat, model_key=body.model_key)
+    if not model_key:
+        raise HTTPException(409, _no_model_message(_role(chat)))
     effort = _resolve_effort(body.effort or chat.get("effort"), model_key)
     chat["effort"] = effort
     _start_new_job(chat)
@@ -1856,9 +2138,9 @@ async def api_send(cid: str, body: SendMessage):
                         await emit(mev)
                     chat_local = st.get_chat(cid)
                     chat_local, _ = await _maybe_auto_compact(chat_local, model_key, emit)
-                    meta = await oc.ensure_model_loaded(model_key)
+                    meta = await oc.ensure_model_loaded(model_key, meta=_meta(model_key, _role(chat_local)))
                     await emit({"type": "status", "model": meta, "key": model_key, "effort": effort})
-                    if model_key in AGENTIC_KEYS:
+                    if _role(chat_local) == "agentic":
                         async for ev in _agent_loop(
                             chat_local, meta, model_key, effort, think=chat_local.get("think")
                         ):
@@ -1868,7 +2150,7 @@ async def api_send(cid: str, body: SendMessage):
                             await emit(ev)
                     final = st.get_chat(cid)
                     used = _estimate_chat_tokens(final, model_key)
-                    limit = _ctx_limit(model_key)
+                    limit = _ctx_limit(model_key, _role(chat))
                     # Unlock the client now: title and compact must not block sending
                     await emit({
                         "type": "done",
@@ -1929,7 +2211,7 @@ async def _plain_stream(chat: dict, meta: dict, model_key: str, effort: str | No
     opts = oc.model_options(meta, _num_ctx_for(chat, model_key))
     resolved_effort = _resolve_effort(effort, model_key)
     opts, effort_meta = _apply_effort(meta, opts, resolved_effort)
-    if model_key == "reasoning":
+    if _role(chat) == "reasoning":
         msgs = list(msgs)
         msgs[0] = {
             **msgs[0],
@@ -1947,9 +2229,7 @@ async def _plain_stream(chat: dict, meta: dict, model_key: str, effort: str | No
     st.save_chat(chat)
     full = ""
     think_flag = None
-    if model_key == "general":
-        think_flag = True if think is None else bool(think)
-    elif model_key == "reasoning":
+    if _role(chat) in ("chat", "reasoning"):
         # Respect UI Thinking toggle (default on when unset).
         think_flag = True if think is None else bool(think)
     elif chat.get("computer_use"):
@@ -1958,6 +2238,9 @@ async def _plain_stream(chat: dict, meta: dict, model_key: str, effort: str | No
     # The effort tier is a ceiling: dragging the slider to "low" means no thinking
     # pass at all, whatever the per-model default was.
     if not effort_meta.get("think", True):
+        think_flag = False
+    # Ollama 400s on think=true for a model without the capability.
+    if think_flag and not meta.get("think"):
         think_flag = False
     async for chunk in oc.stream_chat(meta["id"], msgs, keep_alive=meta["keep_alive"], options=opts, think=think_flag):
         msg = chunk.get("message") or {}
@@ -2108,14 +2391,18 @@ SUBAGENT_REPORT_MAX_CHARS = 6000
 
 # Events that park the run on the user. They must reach the client from a
 # sub-run too, or the sub-run waits on an answer nobody was asked for.
+# A model that mangles the same schema will keep doing so, so this budget is
+# per run and does not reset when an unrelated call succeeds.
+MALFORMED_CALL_LIMIT = 3
+
 _PROMPT_EVENTS = frozenset({
     "ask_user", "ask_user_done", "shell_approval", "shell_approval_done",
 })
 
 
-def _allowed_tool_names(chat: dict) -> set[str]:
+def _allowed_tool_names(chat: dict, ctx_limit: int | None = None) -> set[str]:
     """Tools this run may actually execute, not merely the ones it was offered."""
-    return {t["function"]["name"] for t in agent.tool_defs_for(chat)}
+    return {t["function"]["name"] for t in agent.tool_defs_for(chat, ctx_limit)}
 
 
 async def _run_subagent(
@@ -2138,7 +2425,7 @@ async def _run_subagent(
         "id": f"{parent.get('id') or 'chat'}-sub-{uuid.uuid4().hex[:6]}",
         "mode": parent.get("mode") or "agentic",
         "project_id": parent.get("project_id"),
-        "agent_model": parent.get("agent_model"),
+        "model_id": parent.get("model_id"),
         "title": f"Sub-task: {task[:48]}",
         "subagent": {
             "parent": parent.get("id"),
@@ -2231,6 +2518,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
     plan_prose_stalls = 0
     plan_repeat_recoveries = 0
     force_action_next = False
+    malformed_stalls = 0
     rejection_nudge = ""
     plan_checkpoint_due = False
     # Resume an interrupted plan on the first sample, without waiting for the
@@ -2277,7 +2565,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
     # model actually calls ask_user, then stop.
     clarify_first = bool(settings.get("clarify_first_turn")) and not chat.get("asked_this_job")
     from config import EFFORT as _EFFORT
-    think_flag = bool(think)
+    think_flag = bool(think) and bool(meta.get("think"))
     if not (_EFFORT.get(agent_effort) or {}).get("think", True):
         think_flag = False
 
@@ -2348,7 +2636,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         # Report the window every step, so the meter fills as the run goes
         # instead of jumping at the end. Taken from the prompt just rendered.
         step_used = _estimate_chat_tokens(chat, active_key, msgs=msgs)
-        step_limit = _ctx_limit(active_key)
+        step_limit = _ctx_limit(active_key, "agentic")
         yield {
             "type": "context",
             "used": step_used,
@@ -2405,13 +2693,13 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         if action_only:
             # Shrinking a retry that already hit the token limit guarantees
             # another truncation. Retry in the full configured context.
-            recovery_ctx = max(int(opts.get("num_ctx") or 0), _ctx_limit(active_key))
+            recovery_ctx = max(int(opts.get("num_ctx") or 0), _ctx_limit(active_key, "agentic"))
             opts["num_ctx"] = recovery_ctx
             # Size against the reduced recovery prompt, not the full ten-turn
             # replay that was intentionally discarded above.
             prompt_tokens = oc.estimate_messages_tokens(msgs)
             prompt_tokens += oc.estimate_tokens(
-                json.dumps(agent.tool_defs_for(chat), ensure_ascii=False)
+                json.dumps(agent.tool_defs_for(chat, step_limit), ensure_ascii=False)
             ) + 384
             available = max(2048, recovery_ctx - prompt_tokens - 1024)
             current_predict = int(opts.get("num_predict") or 8192)
@@ -2462,7 +2750,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                     msgs,
                     keep_alive=active_meta["keep_alive"],
                     options=opts,
-                    tools=agent.tool_defs_for(chat),
+                    tools=agent.tool_defs_for(chat, _ctx_limit(active_key, "agentic")),
                     # Only the opening sample thinks. Thinking on every round
                     # eats the whole output budget before a call is emitted.
                     think=bool(think_flag and not action_only and step == 0),
@@ -2518,7 +2806,7 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
             # a count that omits them is not what the model receives.
             "prompt_tokens_sent": (
                 oc.estimate_messages_tokens(msgs)
-                + oc.estimate_tokens(json.dumps(agent.tool_defs_for(chat), ensure_ascii=False))
+                + oc.estimate_tokens(json.dumps(agent.tool_defs_for(chat, step_limit), ensure_ascii=False))
                 + 128
             ),
             # prompt_eval_count is the full prompt length whether or not the
@@ -2564,6 +2852,10 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         assistant["thinking"] = "\n".join(work_log)
         calls = agent.extract_tool_calls({"content": content, "tool_calls": native_calls})
         calls = agent.dedupe_tool_calls(calls, limit=8)
+        if calls and not native_calls:
+            # Weaker models write the call into the reply instead of the
+            # tool_calls field. Worth seeing in the log when it happens.
+            _log(f"[loop guard] recovered {len(calls)} tool call(s) from the reply body")
 
         assistant["tool_calls"] = [
             {
@@ -2637,10 +2929,10 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
                 yield {"type": "tool_start", "name": call["name"], "arguments": call["arguments"]}
                 # Withholding a schema is advice, not enforcement: run_tool
                 # dispatches on name, so a withheld tool still executes.
-                if call["name"] not in _allowed_tool_names(chat):
+                if call["name"] not in _allowed_tool_names(chat, step_limit):
                     result = json.dumps({
                         "error": f"{call['name']} is not available in this sub-task.",
-                        "available": sorted(_allowed_tool_names(chat)),
+                        "available": sorted(_allowed_tool_names(chat, step_limit)),
                         "hint": "Use one of the available tools, or report what you have found.",
                     })
                 elif call["name"] == "delegate":
@@ -2924,7 +3216,37 @@ async def _agent_loop(chat: dict, meta: dict, model_key: str, effort: str | None
         # One exception, about the shape of the reply rather than the plan. Qwen
         # sometimes narrates its next action instead of taking it. That is a
         # failed action, bounded by the same stall budget as an empty response.
-        if content and no_action_stalls < 3 and agent.looks_incomplete(content):
+        # A tool call the model wrote into the reply but mangled. Parseable ones
+        # already ran above; this is the unparseable remainder, which would
+        # otherwise be shown to the user as raw JSON and end the run.
+        broken = agent.looks_like_broken_tool_call(content) if content else None
+        if broken and malformed_stalls < MALFORMED_CALL_LIMIT:
+            # Its own budget, not the stall budget: that one resets on every
+            # successful call, so a model alternating good and mangled calls
+            # would retry the mangled one without bound.
+            malformed_stalls += 1
+            force_action_next = True
+            _log(f"[loop guard] malformed {broken} call in the reply body "
+                 f"({malformed_stalls}/{MALFORMED_CALL_LIMIT})")
+            if chat.get("messages") and chat["messages"][-1] is assistant:
+                chat["messages"].pop()
+            rejection_nudge = (
+                f"[agent-loop] Your last reply wrote a {broken} call into the message body and "
+                "the JSON was malformed, so nothing ran. Do not print tool calls as text. "
+                "Emit it as a native tool call."
+            )
+            st.save_chat(chat)
+            yield {
+                "type": "status",
+                "model": {"label": f"Retrying a malformed tool call "
+                                   f"({malformed_stalls}/{MALFORMED_CALL_LIMIT})…"},
+                "key": active_key,
+            }
+            continue
+
+        # `broken` already had its own budget above; charging the narration
+        # budget for the same reply spends six retries on one failure.
+        if content and not broken and no_action_stalls < 3 and agent.looks_incomplete(content):
             no_action_stalls += 1
             force_action_next = True
             _log(f"[loop] narration instead of an action ({no_action_stalls}/3)")
@@ -3040,7 +3362,7 @@ async def api_compact(cid: str):
             chat["summary"] = summary
             st.save_chat(chat)
             used = _estimate_chat_tokens(chat, model_key)
-            limit = _ctx_limit(model_key)
+            limit = _ctx_limit(model_key, _role(chat))
             yield _sse({
                 "type": "compacted",
                 "messages": chat.get("messages") or [],
@@ -3097,6 +3419,7 @@ class ResubmitBody(BaseModel):
     content: str
     model_key: str | None = None
     agent_model: str | None = None
+    mode: str | None = None
     think: bool | None = None
     effort: str | None = None
 
@@ -3108,16 +3431,16 @@ async def api_resubmit_message(cid: str, mid: str, body: ResubmitBody):
     if not chat:
         raise HTTPException(404, "Message not found or not a user message")
 
-    if body.model_key in MODELS:
+    if _is_known_model_key(body.model_key):
         mk = body.model_key
-        if mk in AGENTIC_KEYS:
+        if _requested_role(body, chat) == "agentic":
             chat["mode"] = "agentic"
-            chat["agent_model"] = _agent_model_choice(body.agent_model, mk)
+            chat["model_id"] = _agent_model_choice(body.agent_model or mk)
             chat["reasoning"] = False
         else:
             chat["mode"] = "chat"
             chat["computer_use"] = False
-            chat["reasoning"] = mk == "reasoning"
+            chat["model_id"] = mk
         st.save_chat(chat)
 
     if body.think is not None:
@@ -3146,9 +3469,9 @@ async def api_resubmit_message(cid: str, mid: str, body: ResubmitBody):
                 try:
                     chat_local = st.get_chat(cid)
                     chat_local, _ = await _maybe_auto_compact(chat_local, model_key, emit)
-                    meta = await oc.ensure_model_loaded(model_key)
+                    meta = await oc.ensure_model_loaded(model_key, meta=_meta(model_key, _role(chat_local)))
                     await emit({"type": "status", "model": meta, "key": model_key, "effort": effort})
-                    if model_key in AGENTIC_KEYS:
+                    if _role(chat_local) == "agentic":
                         async for ev in _agent_loop(
                             chat_local, meta, model_key, effort, think=chat_local.get("think")
                         ):
@@ -3158,7 +3481,7 @@ async def api_resubmit_message(cid: str, mid: str, body: ResubmitBody):
                             await emit(ev)
                     final = st.get_chat(cid)
                     used = _estimate_chat_tokens(final, model_key)
-                    limit = _ctx_limit(model_key)
+                    limit = _ctx_limit(model_key, _role(chat))
                     await emit({
                         "type": "done",
                         "chat_id": cid,
@@ -3275,23 +3598,20 @@ async def api_context(cid: str):
     if not chat:
         raise HTTPException(404)
     key = _model_key(chat)
-    meta = MODELS[key]
+    meta = _meta(key, _role(chat))
     used = _estimate_chat_tokens(chat, key)
-    limit = _ctx_limit(key)
+    limit = _ctx_limit(key, _role(chat))
     settings = st.load_settings()
-    setting_key = {
-        "general": "chat_context",
-        "reasoning": "reasoning_context",
-        "agent": "agent_context",
-        "coder": "coder_context",
-    }.get(key, "chat_context")
+    role = _role(chat)
     return {
         "used": used,
         "limit": limit,
         "pct": round(100 * used / max(limit, 1), 1),
         "model": meta,
         "key": key,
-        "setting_key": setting_key,
+        "effort_levels": reg.effort_levels(meta),
+        "thinking": reg.thinking_summary(meta),
+        "role": role,
         "context_max": int(meta.get("context_max") or limit),
         "has_summary": bool(chat.get("summary")),
     }

@@ -6,10 +6,13 @@ import contextlib
 import json
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 try:
+    import config
     import server
+    import models
+    import storage as st
 except ModuleNotFoundError:
     server = None
 
@@ -346,7 +349,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "save_chat", side_effect=lambda value: value),
             patch.object(server.st, "load_settings", return_value={
                 "agent_repeat_limit": 3,
-                "agent_context": 32768,
+                "role_context": {"agentic": 32768},
                 "shell_approval_mode": "never_ask",
             }),
         ):
@@ -463,7 +466,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "save_chat", side_effect=lambda value: value),
             patch.object(server.st, "load_settings", return_value={
                 "agent_repeat_limit": 2,
-                "agent_context": 32768,
+                "role_context": {"agentic": 32768},
                 "shell_approval_mode": "never_ask",
             }),
         ):
@@ -543,7 +546,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "save_chat", side_effect=lambda value: value),
             patch.object(server.st, "load_settings", return_value={
                 "agent_repeat_limit": 3,
-                "agent_context": 32768,
+                "role_context": {"agentic": 32768},
                 "shell_approval_mode": "never_ask",
             }),
         ):
@@ -617,7 +620,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "save_chat", side_effect=lambda value: value),
             patch.object(server.st, "load_settings", return_value={
                 "agent_repeat_limit": 3,
-                "agent_context": 32768,
+                "role_context": {"agentic": 32768},
                 "shell_approval_mode": "never_ask",
             }),
         ):
@@ -704,7 +707,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "save_chat", side_effect=lambda value: value),
             patch.object(server.st, "load_settings", return_value={
                 "agent_repeat_limit": 3,
-                "agent_context": 32768,
+                "role_context": {"agentic": 32768},
                 "shell_approval_mode": "never_ask",
             }),
         ):
@@ -821,7 +824,7 @@ class AgentLoopExecutionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "save_chat", side_effect=lambda value: value),
             patch.object(server.st, "load_settings", return_value={
                 "agent_repeat_limit": 3,
-                "agent_context": 32768,
+                "role_context": {"agentic": 32768},
                 "shell_approval_mode": "never_ask",
             }),
         ):
@@ -893,7 +896,7 @@ class AgentLoopRecoveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "save_chat", side_effect=lambda value: value),
             patch.object(server.st, "load_settings", return_value={
                 "agent_repeat_limit": 3,
-                "agent_context": 32768,
+                "role_context": {"agentic": 32768},
                 "shell_approval_mode": "never_ask",
             }),
         ):
@@ -914,6 +917,45 @@ class AgentLoopRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("A tool rejected your last calls", _prompt_text(sampling_calls[-1]))
         self.assertEqual(events[-1]["message"]["content"], "Split the edit and finished.")
 
+
+    async def _agent_think_flag(self, meta, requested_think):
+        seen = []
+
+        async def fake_stream_chat(model_id, msgs, **kw):
+            seen.append(kw.get("think"))
+            yield {"message": {"content": "Done."}, "done": True, "done_reason": "stop"}
+
+        async def fake_ensure(key, meta=None):
+            return meta or {"id": key, "keep_alive": "1m"}
+
+        async def no_compact(chat, model_key, emit=None, msgs=None):
+            return chat, False
+
+        chat = {"id": "think-gate", "project_id": None, "mode": "agentic",
+                "model_id": meta["id"], "messages": [{"role": "user", "content": "Hi."}]}
+        with (
+            patch.object(server.oc, "stream_chat", new=fake_stream_chat),
+            patch.object(server.oc, "ensure_model_loaded", side_effect=fake_ensure),
+            patch.object(server, "_maybe_auto_compact", new=no_compact),
+            patch.object(server.st, "save_chat", side_effect=lambda value: value),
+            patch.object(server.st, "load_settings", return_value={
+                "agent_repeat_limit": 3, "role_context": {"agentic": 32768},
+                "shell_approval_mode": "never_ask",
+            }),
+        ):
+            [e async for e in server._agent_loop(chat, meta, meta["id"], think=requested_think)]
+        return seen[0]
+
+    async def test_the_agent_loop_lets_a_thinking_model_think(self):
+        meta = {"id": "m", "keep_alive": "1m", "temperature": 0.2, "context": 32768, "think": True}
+
+        self.assertTrue(await self._agent_think_flag(meta, True))
+
+    async def test_the_agent_loop_never_asks_a_blind_model_to_think(self):
+        meta = {"id": "m", "keep_alive": "1m", "temperature": 0.2, "context": 32768, "think": False}
+
+        self.assertFalse(await self._agent_think_flag(meta, True))
+
     async def test_non_hybrid_never_swaps_models(self):
         loaded = []
 
@@ -922,15 +964,15 @@ class AgentLoopRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_ensure(key):
             loaded.append(key)
-            return {"id": server.MODELS[key]["id"], "keep_alive": "1m",
+            return {"id": key, "keep_alive": "1m",
                     "temperature": 0.2, "context": 32768}
 
         async def no_compact(chat, model_key, emit=None, msgs=None):
             return chat, False
 
-        chat = {"id": "no-swap", "project_id": None, "agent_model": "agent",
+        chat = {"id": "no-swap", "project_id": None, "model_id": config.DEFAULT_AGENT_MODEL,
                 "messages": [{"role": "user", "content": "Hi."}]}
-        meta = {"id": server.MODELS["agent"]["id"], "keep_alive": "1m",
+        meta = {"id": config.DEFAULT_AGENT_MODEL, "keep_alive": "1m",
                 "temperature": 0.2, "context": 32768}
 
         with (
@@ -939,7 +981,7 @@ class AgentLoopRecoveryTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server, "_maybe_auto_compact", new=no_compact),
             patch.object(server.st, "save_chat", side_effect=lambda value: value),
             patch.object(server.st, "load_settings", return_value={
-                "agent_repeat_limit": 3, "agent_context": 32768,
+                "agent_repeat_limit": 3, "role_context": {"agentic": 32768},
                 "shell_approval_mode": "never_ask",
             }),
         ):
@@ -1185,7 +1227,7 @@ class CompactionIsNonDestructiveTests(unittest.IsolatedAsyncioTestCase):
              patch.object(server.st, "save_chat", new=lambda c: c), \
              patch.object(server.st, "load_settings",
                           new=lambda: {"auto_compact_at": 0.85, "compact_keep_recent": 4,
-                                       "agent_context": 65536}):
+                                       "role_context": {"agentic": 65536}}):
             _, did = await server._maybe_auto_compact(chat, "agent", None)
 
         self.assertTrue(did)
@@ -1322,7 +1364,7 @@ class GatesRemovedTests(unittest.IsolatedAsyncioTestCase):
     """Phase 3: the loop no longer counts the model's moves and then refuses them."""
 
     META = {"id": "test-model", "keep_alive": "1m", "temperature": 0.2, "context": 32768}
-    SETTINGS = {"agent_repeat_limit": 3, "agent_context": 65536,
+    SETTINGS = {"agent_repeat_limit": 3, "role_context": {"agentic": 65536},
                 "shell_approval_mode": "never_ask"}
 
     async def _run(self, fake_stream, chat):
@@ -1522,7 +1564,7 @@ class OffloadWiringTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(server.agent, "run_tool", side_effect=lambda *a, **k: raw),
                 patch.object(server.st, "save_chat", side_effect=lambda v: v),
                 patch.object(server.st, "load_settings", return_value={
-                    "agent_repeat_limit": 3, "agent_context": 65536,
+                    "agent_repeat_limit": 3, "role_context": {"agentic": 65536},
                     "shell_approval_mode": "never_ask"}),
             ):
                 [e async for e in server._agent_loop(
@@ -1555,7 +1597,7 @@ class DelegationTests(unittest.IsolatedAsyncioTestCase):
     second co-resident model does not fit on a 24GB card."""
 
     META = {"id": "test-model", "keep_alive": "1m", "temperature": 0.2, "context": 32768}
-    SETTINGS = {"agent_repeat_limit": 3, "agent_context": 65536,
+    SETTINGS = {"agent_repeat_limit": 3, "role_context": {"agentic": 65536},
                 "shell_approval_mode": "never_ask"}
 
     def setUp(self):
@@ -1855,7 +1897,7 @@ class AskUserDisciplineTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server, "_maybe_auto_compact", new=no_compact),
             patch.object(server.st, "save_chat", side_effect=lambda v: v),
             patch.object(server.st, "load_settings", return_value={
-                "agent_repeat_limit": 3, "agent_context": 65536,
+                "agent_repeat_limit": 3, "role_context": {"agentic": 65536},
                 "shell_approval_mode": "never_ask"}),
         ]
         if run_tool is not None:
@@ -1951,8 +1993,11 @@ class AgenticModelPersistenceTests(unittest.IsolatedAsyncioTestCase):
             store["c1"] = chat
             return chat
 
+        # Pinned: these assert the default division of labour, so a machine
+        # whose saved settings point elsewhere must not change the result.
         with patch.object(server.st, "new_chat", side_effect=new_chat), \
              patch.object(server.st, "get_chat", side_effect=lambda cid: store.get(cid)), \
+             patch.object(server.st, "load_settings", return_value={}), \
              patch.object(server.st, "save_chat", side_effect=lambda c: store.__setitem__(c["id"], c) or c):
             yield
 
@@ -1960,37 +2005,42 @@ class AgenticModelPersistenceTests(unittest.IsolatedAsyncioTestCase):
         store = {}
         with self._storage(store):
             chat = await server.api_new_chat(
-                server.ChatCreate(mode="agentic", agent_model="agent")
+                server.ChatCreate(mode="agentic", agent_model=config.DEFAULT_AGENT_MODEL)
             )
-        self.assertEqual(chat["agent_model"], "agent")
-        self.assertEqual(server._model_key(chat), "agent")
+        self.assertEqual(chat["model_id"], config.DEFAULT_AGENT_MODEL)
+        self.assertEqual(server._model_key(chat), config.DEFAULT_AGENT_MODEL)
 
     async def test_a_new_agentic_chat_without_a_pick_gets_the_executor(self):
         store = {}
         with self._storage(store):
             chat = await server.api_new_chat(server.ChatCreate(mode="agentic"))
-        self.assertEqual(chat["agent_model"], server.DEFAULT_AGENT_KEY)
+        self.assertEqual(chat["model_id"], config.DEFAULT_CODER_MODEL)
 
-    async def test_a_chat_tab_conversation_carries_no_agent_model(self):
+    async def test_a_chat_tab_conversation_carries_no_agentic_pick(self):
         store = {}
         with self._storage(store):
             chat = await server.api_new_chat(server.ChatCreate(mode="chat"))
-        self.assertNotIn("agent_model", chat)
+        self.assertNotIn("model_id", chat)
 
     async def test_patching_retargets_an_open_chat_without_starting_a_new_one(self):
-        store = {"c1": {"id": "c1", "mode": "agentic", "agent_model": "coder"}}
+        store = {"c1": {"id": "c1", "mode": "agentic", "model_id": config.DEFAULT_CODER_MODEL}}
         with self._storage(store):
             chat = await server.api_patch_chat(
-                "c1", server.ChatPatch(mode="agentic", agent_model="agent")
+                "c1", server.ChatPatch(mode="agentic", agent_model=config.DEFAULT_AGENT_MODEL)
             )
-        self.assertEqual(chat["agent_model"], "agent")
-        self.assertEqual(server._model_key(chat), "agent")
+        self.assertEqual(chat["model_id"], config.DEFAULT_AGENT_MODEL)
+        self.assertEqual(server._model_key(chat), config.DEFAULT_AGENT_MODEL)
 
     async def test_a_bogus_agent_model_leaves_the_existing_pick_alone(self):
-        store = {"c1": {"id": "c1", "mode": "agentic", "agent_model": "agent"}}
+        store = {"c1": {"id": "c1", "mode": "agentic", "model_id": config.DEFAULT_AGENT_MODEL}}
         with self._storage(store):
             chat = await server.api_patch_chat("c1", server.ChatPatch(agent_model="nonsense"))
-        self.assertEqual(chat["agent_model"], "agent")
+        self.assertEqual(chat["model_id"], config.DEFAULT_AGENT_MODEL)
+
+    async def test_a_chat_that_predates_roles_is_migrated_on_read(self):
+        chat = st._migrate_chat({"id": "old", "mode": "agentic", "agent_model": "coder"})
+        self.assertEqual(chat["model_id"], config.DEFAULT_CODER_MODEL)
+        self.assertNotIn("agent_model", chat)
 
 
 @unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
@@ -2003,7 +2053,7 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
 
     SETTINGS = {
         "agent_repeat_limit": 3,
-        "agent_context": 32768,
+        "role_context": {"agentic": 32768},
         "shell_approval_mode": "safe_auto",
     }
     META = {"id": "test-model", "keep_alive": "1m", "temperature": 0.2, "context": 32768}
@@ -2100,3 +2150,459 @@ class ParkedPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(e.get("type") == "shell_approval_done" for e in events))
         # And the sub-run still returns a result rather than dying on the prompt.
         self.assertTrue(any(e.get("type") == "subagent_result" for e in events))
+
+
+@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+class RoleDerivationTests(unittest.TestCase):
+    """Roles key the prompt, effort and window; the UI still speaks the old names."""
+
+    def test_mode_decides_the_role(self):
+        self.assertEqual(server._role({"mode": "chat"}), "chat")
+        self.assertEqual(server._role({"mode": "agentic"}), "agentic")
+        self.assertEqual(server._role({"mode": "computer"}), "agentic")
+        self.assertEqual(server._role({"mode": "code"}), "agentic")
+
+    def test_reasoning_is_a_variant_of_chat_not_a_mode(self):
+        self.assertEqual(server._role({"mode": "chat", "reasoning": True}), "reasoning")
+        self.assertEqual(server._role({"mode": "chat"}, reasoning=True), "reasoning")
+        # An agentic run never becomes a reasoning run.
+        self.assertEqual(server._role({"mode": "agentic", "reasoning": True}), "agentic")
+
+    def test_the_reasoning_flag_travels_with_the_chat_model(self):
+        # Reasoning is not a model of its own, so the same id serves both and
+        # only the role tells them apart.
+        chat = {"mode": "chat", "reasoning": True}
+        self.assertEqual(server._role(chat), "reasoning")
+        self.assertEqual(server._role({**chat, "reasoning": False}), "chat")
+
+
+@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+class ThinkingGateTests(unittest.IsolatedAsyncioTestCase):
+    """think=true on a model without the capability is a hard 400 from Ollama.
+
+    The client retries without it, but the server must not send it in the first
+    place, or every such turn costs a wasted round trip.
+    """
+
+    def _capture(self):
+        seen = []
+
+        async def fake_stream(model_id, msgs, **kw):
+            seen.append(kw.get("think"))
+            yield {"message": {"content": "done"}, "done": True}
+
+        return seen, fake_stream
+
+    async def _run_plain(self, profile, requested_think):
+        seen, fake_stream = self._capture()
+        chat = {"id": "t1", "mode": "chat", "messages": [{"role": "user", "content": "hi"}]}
+        with patch.object(server.oc, "stream_chat", fake_stream), \
+             patch.object(server.st, "save_chat", side_effect=lambda c: c), \
+             patch.object(server.st, "load_settings", return_value={}), \
+             patch.object(server, "_build_messages", return_value=[{"role": "system", "content": "s"}]), \
+             patch.object(server, "_num_ctx_for", return_value=4096):
+            async for _ in server._plain_stream(chat, profile, profile["id"], effort="high",
+                                                think=requested_think):
+                pass
+        return seen[0]
+
+    async def test_a_thinking_model_is_allowed_to_think(self):
+        profile = {"id": "m", "keep_alive": "5m", "think": True, "label": "M"}
+
+        self.assertTrue(await self._run_plain(profile, True))
+
+    async def test_a_model_without_the_capability_is_never_asked_to_think(self):
+        profile = {"id": "m", "keep_alive": "5m", "think": False, "label": "M"}
+
+        self.assertFalse(await self._run_plain(profile, True))
+
+    async def test_an_unprofiled_model_is_not_asked_to_think_either(self):
+        profile = {"id": "m", "keep_alive": "5m", "label": "M"}
+
+        self.assertFalse(await self._run_plain(profile, True))
+
+
+@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+class MalformedCallGuardTests(unittest.IsolatedAsyncioTestCase):
+    """A tool call written into the reply and mangled beyond parsing.
+
+    Observed on llama3.2:3b: the run ended having done nothing, showing raw
+    JSON as the answer. The loop retries instead, on a budget of its own so a
+    model alternating good and mangled calls cannot retry without bound.
+    """
+
+    async def _run(self, replies):
+        samples = []
+
+        async def fake_stream_chat(model_id, msgs, **kw):
+            i = min(len(samples), len(replies) - 1)
+            samples.append(msgs)
+            yield {"message": {"content": replies[i]}, "done": True, "done_reason": "stop"}
+
+        async def fake_ensure(key, meta=None):
+            return meta or {"id": key, "keep_alive": "1m"}
+
+        async def no_compact(chat, model_key, emit=None, msgs=None):
+            return chat, False
+
+        chat = {"id": "mangled", "project_id": None, "mode": "agentic",
+                "model_id": "m", "messages": [{"role": "user", "content": "Plan it."}]}
+        meta = {"id": "m", "keep_alive": "1m", "temperature": 0.2, "context": 32768, "think": False}
+        with (
+            patch.object(server.oc, "stream_chat", new=fake_stream_chat),
+            patch.object(server.oc, "ensure_model_loaded", side_effect=fake_ensure),
+            patch.object(server, "_maybe_auto_compact", new=no_compact),
+            patch.object(server.st, "save_chat", side_effect=lambda v: v),
+            patch.object(server.st, "load_settings", return_value={
+                "agent_repeat_limit": 3, "role_context": {"agentic": 32768},
+                "shell_approval_mode": "never_ask"}),
+        ):
+            events = [e async for e in server._agent_loop(chat, meta, "m", think=False)]
+        return samples, events
+
+    MANGLED = '{"name":"todo_write","parameters":{"todos":[["a":1]]}}'
+
+    async def test_a_mangled_call_is_retried_rather_than_shown_as_the_answer(self):
+        samples, _ = await self._run([self.MANGLED, "Done, the plan is set."])
+
+        self.assertGreater(len(samples), 1)
+        # The retry tells the model what went wrong.
+        text = "\n".join(m.get("content") or "" for m in samples[1])
+        self.assertIn("malformed", text.lower())
+
+    async def test_endless_mangling_stops_instead_of_looping(self):
+        samples, events = await self._run([self.MANGLED])
+
+        self.assertLessEqual(len(samples), server.MALFORMED_CALL_LIMIT + 2)
+        self.assertTrue(events)
+
+    async def test_a_clean_reply_is_never_retried(self):
+        samples, _ = await self._run(["All done, the tests pass."])
+
+        self.assertEqual(len(samples), 1)
+
+
+@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+class EmptyRoleTests(unittest.TestCase):
+    """With nothing able to call tools, agentic mode has to say so."""
+
+    def _pick(self, registry, settings):
+        with patch.object(server.st, "load_settings", return_value=settings), \
+             patch.object(server.reg, "installed", return_value=registry):
+            return server._model_key({"id": "c", "mode": "agentic"})
+
+    def test_a_chat_only_model_that_can_call_tools_is_used(self):
+        registry = {"m": {"id": "m", "label": "m", "tools": True, "think": False}}
+        settings = {"model_roles": {"m": ["chat"]}}
+
+        self.assertEqual(self._pick(registry, settings), "m")
+
+    def test_a_model_without_tools_is_never_pressed_into_agentic_service(self):
+        # Falling back to it would fail inside Ollama with nothing useful to show.
+        registry = {"m": {"id": "m", "label": "m", "tools": False, "think": False}}
+        settings = {"model_roles": {"m": ["chat"]}}
+
+        self.assertEqual(self._pick(registry, settings), "")
+
+    def test_the_message_tells_the_user_what_to_do_about_it(self):
+        message = server._no_model_message("agentic")
+
+        self.assertIn("tool", message.lower())
+        self.assertIn("Models", message)
+
+
+@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+class ModelApiTests(unittest.IsolatedAsyncioTestCase):
+    """The endpoints the Models panel is built on."""
+
+    REGISTRY = {
+        "big:27b": {"id": "big:27b", "label": "Big", "tools": True, "vision": True,
+                    "think": True, "context_max": 262144, "weights_bytes": 16 * 1024**3,
+                    "kv_bytes_per_token": 88500},
+        "coder:30b": {"id": "coder:30b", "label": "Coder", "tools": True, "vision": False,
+                      "think": False, "context_max": 262144, "weights_bytes": 17 * 1024**3,
+                      "kv_bytes_per_token": 49152},
+        "blind:8b": {"id": "blind:8b", "label": "Blind", "tools": False, "vision": False,
+                     "think": False, "context_max": 32768, "weights_bytes": 5 * 1024**3,
+                     "kv_bytes_per_token": 8192},
+    }
+
+    def _env(self, settings=None, saved=None):
+        store = dict(settings or {})
+
+        def save(patch):
+            store.update(patch)
+            if saved is not None:
+                saved.update(patch)
+            return store
+
+        return (
+            patch.object(server.st, "load_settings", return_value=store),
+            patch.object(server.st, "save_settings", side_effect=save),
+            patch.object(server.reg, "installed", return_value=dict(self.REGISTRY)),
+        )
+
+    async def test_listing_reports_capability_roles_and_fit(self):
+        with contextlib.ExitStack() as stack:
+            for p in self._env():
+                stack.enter_context(p)
+            body = await server.api_models()
+
+        rows = {m["id"]: m for m in body["installed"]}
+        self.assertEqual(rows["blind:8b"]["can"]["agentic"], False)
+        self.assertEqual(rows["big:27b"]["can"], {"chat": True, "reasoning": True, "agentic": True})
+        self.assertNotIn("agentic", rows["blind:8b"]["roles"])
+        self.assertTrue(rows["big:27b"]["fit"]["fits"])
+        self.assertIn("hardware", body)
+
+    async def test_a_toolless_model_cannot_be_assigned_to_agentic(self):
+        with contextlib.ExitStack() as stack:
+            for p in self._env():
+                stack.enter_context(p)
+            with self.assertRaises(server.HTTPException) as caught:
+                await server.api_model_roles(
+                    server.ModelRolesIn(model="blind:8b", roles=["chat", "agentic"]))
+
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertIn("tool", caught.exception.detail.lower())
+
+    async def test_assigning_roles_persists_them(self):
+        saved = {}
+        with contextlib.ExitStack() as stack:
+            for p in self._env(saved=saved):
+                stack.enter_context(p)
+            out = await server.api_model_roles(
+                server.ModelRolesIn(model="coder:30b", roles=["agentic"]))
+
+        self.assertEqual(out["roles"], ["agentic"])
+        self.assertEqual(saved["model_roles"]["coder:30b"], ["agentic"])
+
+    async def test_the_last_chat_model_cannot_be_released(self):
+        settings = {"model_roles": {"big:27b": ["chat"], "coder:30b": [], "blind:8b": []}}
+        with contextlib.ExitStack() as stack:
+            for p in self._env(settings):
+                stack.enter_context(p)
+            with self.assertRaises(server.HTTPException) as caught:
+                await server.api_model_roles(server.ModelRolesIn(model="big:27b", roles=[]))
+
+        self.assertEqual(caught.exception.status_code, 409)
+
+    async def test_releasing_agentic_entirely_is_allowed(self):
+        settings = {"model_roles": {"big:27b": ["chat", "agentic"], "coder:30b": [], "blind:8b": []}}
+        with contextlib.ExitStack() as stack:
+            for p in self._env(settings):
+                stack.enter_context(p)
+            out = await server.api_model_roles(server.ModelRolesIn(model="big:27b", roles=["chat"]))
+
+        self.assertEqual(out["roles"], ["chat"])
+
+    async def test_an_unknown_model_is_a_404(self):
+        with contextlib.ExitStack() as stack:
+            for p in self._env():
+                stack.enter_context(p)
+            with self.assertRaises(server.HTTPException) as caught:
+                await server.api_model_roles(server.ModelRolesIn(model="ghost:1b", roles=["chat"]))
+
+        self.assertEqual(caught.exception.status_code, 404)
+
+    async def test_a_role_can_only_be_pointed_at_a_model_assigned_to_it(self):
+        settings = {"model_roles": {"big:27b": ["chat"], "coder:30b": [], "blind:8b": []}}
+        with contextlib.ExitStack() as stack:
+            for p in self._env(settings):
+                stack.enter_context(p)
+            with self.assertRaises(server.HTTPException) as caught:
+                await server.api_model_active(
+                    server.ModelRolesIn(model="coder:30b", roles=["chat"]))
+
+        self.assertEqual(caught.exception.status_code, 400)
+
+    # Finding a model to install moved to the library screen, so these two ask
+    # the library endpoint what the catalog used to be asked.
+    LIBRARY = [
+        {"name": "tiny-coder", "description": "a small coding model", "capabilities": ["tools"],
+         "variants": ["3b"], "params": 3e9, "min_params": 3e9, "downloads": 10,
+         "tag_count": 2, "updated": ""},
+        {"name": "huge", "description": "a very large general model", "capabilities": ["tools"],
+         "variants": ["70b"], "params": 70e9, "min_params": 70e9, "downloads": 20,
+         "tag_count": 2, "updated": ""},
+    ]
+
+    def _library(self, stack, usable_gb=8):
+        for p in self._env():
+            stack.enter_context(p)
+        stack.enter_context(patch.object(server.reg, "hardware", return_value={
+            "gpu": "test", "vram_bytes": usable_gb * 1024**3, "ram_bytes": 16 * 1024**3,
+            "free_disk_bytes": 500 * 1024**3, "model_store": "/tmp",
+            "usable_bytes": usable_gb * 1024**3}))
+        stack.enter_context(patch.object(
+            server.lib, "ollama_library", AsyncMock(return_value=list(self.LIBRARY))))
+
+    async def test_the_library_says_what_will_not_fit_before_downloading_it(self):
+        with contextlib.ExitStack() as stack:
+            self._library(stack)
+            body = await server.api_library(source="ollama")
+
+        rows = {e["id"]: e for e in body["items"]}
+        self.assertFalse(rows["huge"]["fits"])
+        self.assertTrue(rows["tiny-coder"]["fits"])
+
+    async def test_searching_the_library_narrows_it(self):
+        with contextlib.ExitStack() as stack:
+            self._library(stack)
+            body = await server.api_library(source="ollama", q="coding")
+
+        self.assertEqual([e["id"] for e in body["items"]], ["tiny-coder"])
+
+    async def test_a_library_that_does_not_exist_is_refused(self):
+        with contextlib.ExitStack() as stack:
+            self._library(stack)
+            with self.assertRaises(server.HTTPException) as caught:
+                await server.api_library(source="civitai")
+
+        self.assertEqual(caught.exception.status_code, 400)
+
+    async def _delete(self, settings, status=200):
+        saved = {}
+        removed = {}
+
+        class Resp:
+            status_code = status
+            text = "" if status == 200 else "boom"
+
+        class Client:
+            def __init__(self, *a, **kw): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def request(self, method, url, json=None):
+                removed["model"] = (json or {}).get("model")
+                return Resp()
+
+        async def refresh():
+            return dict(self.REGISTRY)
+
+        with contextlib.ExitStack() as stack:
+            for p in self._env(settings, saved=saved):
+                stack.enter_context(p)
+            stack.enter_context(patch.object(server.httpx, "AsyncClient", Client))
+            stack.enter_context(patch.object(server.reg, "refresh_registry", refresh))
+            out = await server.api_model_delete(server.ModelTagIn(model="coder:30b"))
+        return out, saved, removed
+
+    async def test_deleting_a_model_clears_everything_that_pointed_at_it(self):
+        settings = {
+            "model_roles": {"big:27b": ["chat"], "coder:30b": ["chat", "agentic"]},
+            "model_active": {"agentic": "coder:30b", "chat": "big:27b"},
+            "model_context": {"coder:30b": 16384, "big:27b": 32768},
+        }
+        out, saved, removed = await self._delete(settings)
+
+        self.assertEqual(removed["model"], "coder:30b")
+        self.assertEqual(out["removed"], "coder:30b")
+        self.assertNotIn("coder:30b", saved["model_roles"])
+        self.assertNotIn("agentic", saved["model_active"])
+        self.assertNotIn("coder:30b", saved["model_context"])
+        # Everything belonging to other models survives.
+        self.assertEqual(saved["model_roles"]["big:27b"], ["chat"])
+        self.assertEqual(saved["model_active"]["chat"], "big:27b")
+        self.assertEqual(saved["model_context"]["big:27b"], 32768)
+
+    async def test_the_last_chat_model_cannot_be_deleted(self):
+        settings = {"model_roles": {"big:27b": [], "coder:30b": ["chat"], "blind:8b": []}}
+        with self.assertRaises(server.HTTPException) as caught:
+            await self._delete(settings)
+
+        self.assertEqual(caught.exception.status_code, 409)
+
+    async def test_an_ollama_failure_is_surfaced_not_swallowed(self):
+        settings = {"model_roles": {"big:27b": ["chat"], "coder:30b": ["agentic"]}}
+        with self.assertRaises(server.HTTPException) as caught:
+            await self._delete(settings, status=500)
+
+        self.assertEqual(caught.exception.status_code, 500)
+
+
+@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+class NoLegacyKeysTests(unittest.IsolatedAsyncioTestCase):
+    """Phase 5 removed the three translations that kept the old UI working.
+
+    Nothing should speak `general`, `reasoning`, `agent` or `coder` any more:
+    the model id is the key, end to end.
+    """
+
+    async def test_health_returns_models_keyed_by_id(self):
+        registry = {"m:7b": {"id": "m:7b", "label": "M", "tools": True, "think": True,
+                             "vision": False, "context_max": 32768}}
+
+        async def tags():
+            return [{"name": "m:7b"}]
+
+        with patch.object(server.st, "load_settings", return_value={}), \
+             patch.object(server.reg, "installed", return_value=registry), \
+             patch.object(server.oc, "list_models", tags):
+            body = await server.health()
+
+        self.assertEqual([m["key"] for m in body["models"]], ["m:7b"])
+        self.assertTrue(body["effort_levels"])
+
+    def test_no_module_still_defines_the_pre_role_translations(self):
+        for name in ("LEGACY_RESOLVE", "_legacy_key"):
+            self.assertFalse(hasattr(server, name), name)
+        for name in ("_legacy_context_view", "_absorb_legacy_context"):
+            self.assertFalse(hasattr(st, name), name)
+        self.assertFalse(hasattr(config, "LEGACY_CONTEXT_SETTING"))
+
+    def test_settings_no_longer_synthesise_the_four_context_keys(self):
+        loaded = st.load_settings()
+
+        for legacy in ("chat_context", "reasoning_context", "agent_context", "coder_context"):
+            self.assertNotIn(legacy, loaded, legacy)
+        self.assertIn("role_context", loaded)
+
+    def test_a_saved_chat_from_before_roles_still_resolves(self):
+        # The one-way migration stays; only the two-way shims went.
+        chat = st._migrate_chat({"id": "old", "mode": "agentic", "agent_model": "coder"})
+
+        self.assertEqual(chat["model_id"], config.DEFAULT_CODER_MODEL)
+
+
+@unittest.skipIf(server is None, "server dependencies are installed in Aether's .venv")
+class RequestedRoleTests(unittest.TestCase):
+    """Which tab a turn came from cannot be inferred from the model.
+
+    A model assigned to both roles has one id for both, so inferring the role
+    from it turned every Chat message into an agentic run: wrong prompt, wrong
+    window, and the tool schemas attached. Caught by driving the real UI.
+    """
+
+    def test_the_request_decides_not_the_model(self):
+        body = server.SendMessage(content="hi", model_key=config.DEFAULT_CHAT_MODEL, mode="chat")
+        chat = {"mode": "chat"}
+
+        self.assertEqual(server._requested_role(body, chat), "chat")
+
+    def test_a_model_that_serves_both_roles_still_chats(self):
+        # DEFAULT_CHAT_MODEL is assigned to agentic too; that must not matter.
+        body = server.SendMessage(content="hi", model_key=config.DEFAULT_AGENT_MODEL, mode="chat")
+
+        self.assertEqual(server._requested_role(body, {"mode": "chat"}), "chat")
+
+    def test_an_agentic_turn_is_honoured(self):
+        body = server.SendMessage(content="hi", model_key=config.DEFAULT_CHAT_MODEL, mode="agentic")
+
+        self.assertEqual(server._requested_role(body, {"mode": "chat"}), "agentic")
+
+    def test_the_legacy_mode_names_still_mean_agentic(self):
+        for mode in ("code", "computer", "agentic"):
+            body = server.SendMessage(content="hi", mode=mode)
+            self.assertEqual(server._requested_role(body, {"mode": "chat"}), "agentic", mode)
+
+    def test_a_request_without_a_mode_keeps_the_chat_as_it_is(self):
+        body = server.SendMessage(content="hi")
+
+        self.assertEqual(server._requested_role(body, {"mode": "agentic"}), "agentic")
+        self.assertEqual(server._requested_role(body, {"mode": "chat"}), "chat")
+
+    def test_resubmit_carries_the_mode_too(self):
+        body = server.ResubmitBody(content="hi", mode="chat")
+
+        self.assertEqual(server._requested_role(body, {"mode": "agentic"}), "chat")

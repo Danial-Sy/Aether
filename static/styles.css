@@ -73,6 +73,22 @@ body {
 }
 
 .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 8px; }
+/* Settings is a destination, not a fifth thing to browse, so it sits by the
+   name rather than wrapping the four-column nav onto a second row. */
+.brand .brand-gear {
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 15px;
+  line-height: 1;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  transition: color var(--fast) var(--ease), transform var(--fast) var(--ease);
+}
+.brand .brand-gear:hover { color: var(--text); transform: rotate(45deg); }
+.brand .brand-gear.active { background: transparent; color: var(--accent); }
 .brand-mark, .aether-ring {
   width: 28px;
   height: 28px;
@@ -213,7 +229,16 @@ button:focus-visible,
   color: var(--text); font-weight: 600;
 }
 
-.side-panels { flex: 1; overflow: auto; min-height: 0; }
+/* Every panel shares this scroller, so the clearance belongs here rather than
+   on each of them. Without it a full-width control — the compact slider is the
+   worst — runs under the scrollbar instead of stopping beside it. */
+.side-panels {
+  flex: 1;
+  overflow: auto;
+  min-height: 0;
+  scrollbar-gutter: stable;
+  padding-right: 8px;
+}
 .side-panel { display: none; animation: fadeIn var(--med) var(--ease); }
 .side-panel.active { display: block; }
 .panel-label {
@@ -509,6 +534,8 @@ button:focus-visible,
   transition: background var(--fast);
 }
 .model-option:hover { background: rgba(255,255,255,0.05); }
+/* display:flex above outranks the UA rule for [hidden], so say it here. */
+.model-option[hidden] { display: none; }
 .model-option.selected { background: rgba(77, 163, 255, 0.08); }
 .toggle-option {
   width: 100%; display: flex; align-items: flex-start; gap: 10px;
@@ -1042,6 +1069,37 @@ dialog::backdrop {
   animation: pop 0.22s var(--ease);
 }
 .dialog-card.dialog-wide { width: min(560px, 94vw); }
+.dialog-card .pick-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: min(46vh, 340px);
+  overflow-y: auto;
+  margin: -4px -6px;
+  padding: 4px 6px;
+}
+.dialog-card .pick-options .model-option {
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.02);
+}
+.dialog-card .pick-options .model-option:hover { background: rgba(255, 255, 255, 0.07); }
+.dialog-card .pick-options .model-option.selected {
+  border-color: rgba(110, 168, 255, 0.35);
+  background: rgba(77, 163, 255, 0.10);
+}
+.pick-more {
+  align-self: flex-start;
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 0.82rem;
+  padding: 2px 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.pick-more:hover { color: var(--text); }
 .dialog-card h2 {
   margin: 0;
   font-size: 1.12rem;
@@ -1911,3 +1969,240 @@ body.is-warming { overflow: hidden; }
   font-family: var(--mono);
   font-size: 11px;
 }
+
+/* ── Models panel ──────────────────────────────────────────────────────── */
+.hw-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.hw-card b { color: var(--text); font-weight: 600; }
+.model-cards { display: flex; flex-direction: column; gap: 8px; }
+.model-card {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--panel);
+}
+.model-card-head { display: flex; align-items: baseline; gap: 8px; justify-content: space-between; }
+.model-card-name { font-weight: 600; font-size: 13px; }
+.model-card-size { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.model-card-desc { font-size: 12px; color: var(--muted); margin: 4px 0 8px; line-height: 1.45; }
+.model-card-warn { font-size: 12px; color: #ffb454; margin: 4px 0 8px; }
+.model-card-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.role-toggle {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 3px 11px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.role-toggle.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.role-toggle:disabled { opacity: .4; cursor: not-allowed; }
+.model-card-spacer { flex: 1; }
+.model-tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; }
+.model-progress { height: 4px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 8px; }
+.model-progress > div { height: 100%; background: var(--accent); width: 0; transition: width .2s ease; }
+.mo-empty { font-size: 12px; color: var(--muted); padding: 8px 12px; margin: 0; }
+.toggle-option.disabled { opacity: .45; cursor: not-allowed; }
+
+/* ── Model library ────────────────────────────────────────────────────────
+   A full screen over the app. Browsing a hundred thousand repositories is a
+   different task from switching between the four you installed, so it gets
+   the room and the sidebar keeps the quick one. */
+.library {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  background:
+    radial-gradient(900px 480px at 12% -6%, rgba(79, 124, 255, 0.18), transparent 55%),
+    radial-gradient(800px 460px at 92% 4%, rgba(124, 92, 255, 0.16), transparent 50%),
+    var(--bg0);
+}
+/* The backdrop is opaque from the first frame and never animates, and the app
+   behind it stops rendering entirely. Being covered is not enough: WebKitGTK
+   draws an overlay scrollbar from its own compositing layer, which lands on
+   top of the overlay no matter what it is stacked against. A hidden subtree
+   paints nothing at all, scrollbars included, and visibility costs no reflow
+   the way display would. */
+.library[hidden] { display: none; }
+body.library-open .app { visibility: hidden; }
+.library-top, .library-filters, .library-scroll { animation: libIn var(--med) var(--ease); }
+@keyframes libIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+.library-top {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 16px 22px;
+  border-bottom: 1px solid var(--line);
+}
+.library-sources { display: flex; gap: 4px; background: var(--bg2); border-radius: 999px; padding: 3px; }
+.library-source {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 7px 18px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color var(--fast) var(--ease), background var(--fast) var(--ease);
+}
+.library-source.active { background: var(--accent); color: #fff; }
+.library-search {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg1);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  font: inherit;
+  font-size: 14px;
+  padding: 10px 18px;
+}
+.library-search:focus { outline: none; border-color: var(--accent); }
+
+.library-filters {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 22px;
+  flex-wrap: wrap;
+}
+.library-select {
+  background: var(--bg1);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.library-check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--muted); cursor: pointer; }
+.library-count { margin-left: auto; font-size: 12px; color: var(--muted); }
+
+/* Wide content scrolls inside its own card, never sideways here: leaving the
+   horizontal axis to compute to auto flashes a scrollbar the grid never needs.
+   The gutter is reserved because WebKitGTK draws an overlay scrollbar, which
+   otherwise paints straight over the right-hand column of cards. */
+.library-scroll {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  /* Clearance on top of the reserved gutter, because a GTK overlay scrollbar
+     is wider than the themed one and ignores the reservation. */
+  padding-right: 8px;
+}
+.library-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+  /* Less on the right: the scroller adds its own clearance and the reserved
+     gutter, so this lands the cards the same distance from the bar as from
+     the left edge. */
+  padding: 6px 14px 0 22px;
+  align-content: start;
+}
+.library-foot { padding: 22px; text-align: center; font-size: 12.5px; color: var(--muted); }
+
+.lib-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg1);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  transition: border-color var(--fast) var(--ease), transform var(--fast) var(--ease);
+}
+.lib-card:hover { border-color: rgba(110, 168, 255, 0.5); transform: translateY(-1px); }
+.lib-card.is-installed { border-color: var(--ok); }
+.lib-card-head { display: flex; align-items: baseline; gap: 10px; justify-content: space-between; }
+.lib-card-name {
+  font-weight: 600;
+  font-size: 14.5px;
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lib-card-size.is-here { color: var(--ok); }
+.lib-card-size {
+  font-size: 11.5px;
+  color: var(--accent);
+  white-space: nowrap;
+  font-family: var(--mono);
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lib-card-by { font-size: 11.5px; color: var(--muted); }
+.lib-card-desc {
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.5;
+  margin: 8px 0 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.lib-card-marks { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 10px; }
+.lib-mark {
+  font-size: 10.5px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 9px;
+  color: var(--accent);
+}
+.lib-card-warns { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.lib-card-warns[hidden] { display: none; }
+.lib-card-warns li {
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--warn);
+  padding-left: 15px;
+  position: relative;
+}
+.lib-card-warns li::before { content: "!"; position: absolute; left: 3px; font-weight: 700; }
+.lib-card-foot { display: flex; align-items: center; gap: 8px; margin-top: auto; padding-top: 12px; }
+.lib-card-stats { font-size: 11px; color: var(--muted); }
+
+.variant-list { display: flex; flex-direction: column; gap: 4px; max-height: 46vh; overflow-y: auto; margin: 10px 0; }
+.variant-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  border-radius: 9px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+.variant-row:hover { background: rgba(255, 255, 255, 0.07); }
+.variant-row.fits { border-color: rgba(52, 211, 153, 0.35); }
+.variant-row.is-best { border-color: var(--warn); background: rgba(251, 191, 36, 0.08); }
+.variant-row:disabled { opacity: .45; cursor: not-allowed; }
+.variant-star { width: 14px; color: var(--warn); font-size: 12px; flex: none; }
+.variant-label { font-family: var(--mono); font-size: 13px; min-width: 92px; }
+.variant-meta { font-size: 11.5px; color: var(--muted); margin-left: auto; text-align: right; }
+.variant-row.is-best .variant-meta { color: var(--warn); }

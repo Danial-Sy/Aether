@@ -27,6 +27,8 @@
     <aside class="sidebar" id="sidebar">
       <div class="brand">
         <div class="brand-name">Aether</div>
+        <button class="icon-btn brand-gear side-tab" data-panel="settings"
+                id="btnSettings" title="Settings" aria-label="Settings">⚙</button>
       </div>
 
       <button class="btn-primary new-chat" id="btnNewChat"><span>+</span> New</button>
@@ -35,7 +37,7 @@
         <button class="side-tab active" data-panel="history">History</button>
         <button class="side-tab" data-panel="projects">Projects</button>
         <button class="side-tab" data-panel="memory">Memory</button>
-        <button class="side-tab" data-panel="settings">Settings</button>
+        <button class="side-tab" data-panel="models">Models</button>
       </nav>
 
       <div class="side-panels">
@@ -55,6 +57,16 @@
             <button type="submit" class="btn-ghost">Save</button>
           </form>
           <div class="memory-list" id="memoryList"></div>
+        </div>
+        <div class="side-panel" id="panel-models">
+          <div class="hw-card" id="hwCard"></div>
+
+          <div class="panel-label">Installed</div>
+          <div class="model-cards" id="installedModels"></div>
+
+          <div class="panel-label">Add a model</div>
+          <button class="btn-ghost full" id="btnBrowseLibrary">Browse the libraries</button>
+          <p class="ctx-hint">Every model on Ollama, and every GGUF on Hugging Face.</p>
         </div>
         <div class="side-panel" id="panel-settings">
           <label class="field">
@@ -85,42 +97,18 @@
             </select>
           </label>
           <p class="ctx-hint">Auto-run safe commands lets Aether work without interrupting you: it runs your project's code, edits its files, installs packages and uses git freely. It stops only for things you would want to catch: deleting files (rm, shred), sudo, disk and system commands, writes into system folders, piping a download straight into a shell, and git push / reset --hard / clean -f. Approve one of those with "Always allow" and it will not ask again. Ask every time confirms every command; Never ask runs everything unattended.</p>
-          <p class="ctx-hint">Defaults are the highest comfortable settings for a 3090 Ti 24GB + 32GB RAM with q8 KV. You can push higher, but expect slower responses from RAM spill.</p>
+          <p class="ctx-hint">The window each job gets. A model that cannot serve the size you pick is clamped to its own limit, and a single model can be given its own window from the context dial next to the composer.</p>
           <label class="field">
-            <span>Chat context (Qwen3.8)</span>
-            <select id="setChatCtx">
-              <option value="32768" selected>32K (recommended)</option>
-              <option value="65536">64K (slower)</option>
-              <option value="131072">128K (RAM spill likely)</option>
-              <option value="262144">256K (slower / RAM spill)</option>
-            </select>
+            <span>Chat window</span>
+            <select id="setChatCtx" data-role="chat"></select>
           </label>
           <label class="field">
-            <span>Reasoning context (Qwen3.8)</span>
-            <select id="setReasonCtx">
-              <option value="16384">16K</option>
-              <option value="32768" selected>32K (recommended)</option>
-              <option value="65536">64K (slower)</option>
-              <option value="131072">128K (RAM spill likely)</option>
-            </select>
+            <span>Deep reasoning window</span>
+            <select id="setReasonCtx" data-role="reasoning"></select>
           </label>
           <label class="field">
-            <span>Coder context (Qwen3-Coder)</span>
-            <select id="setCoderCtx">
-              <option value="32768" selected>32K (recommended)</option>
-              <option value="65536">64K (slower)</option>
-              <option value="131072">128K (RAM spill likely)</option>
-              <option value="262144">256K (slower / RAM spill)</option>
-            </select>
-          </label>
-          <label class="field">
-            <span>Agent context (Qwen3.8)</span>
-            <select id="setAgentCtx">
-              <option value="32768" selected>32K (recommended)</option>
-              <option value="65536">64K (slower)</option>
-              <option value="131072">128K (RAM spill likely)</option>
-              <option value="262144">256K (slower / RAM spill)</option>
-            </select>
+            <span>Agentic window</span>
+            <select id="setAgentCtx" data-role="agentic"></select>
           </label>
           <label class="field">
             <span>Repeated-call stop limit</span>
@@ -228,19 +216,13 @@
                 </button>
                 <div class="model-menu" id="modelMenu" hidden role="listbox">
                   <div class="model-group" data-group="chat">
-                    <button type="button" class="model-option" data-model="general">
+                    <div class="model-options" id="chatModelOptions"></div>
+                    <button type="button" class="toggle-option" id="btnReasoning" hidden>
                       <div class="mo-text">
-                        <div class="mo-title">Qwen3.8 27B</div>
-                        <div class="mo-desc">Everyday chat and multimodal</div>
+                        <div class="mo-title">Deep reasoning</div>
+                        <div class="mo-desc" id="reasoningDesc">Think step by step before answering</div>
                       </div>
-                      <span class="mo-check" hidden>✓</span>
-                    </button>
-                    <button type="button" class="model-option" data-model="reasoning">
-                      <div class="mo-text">
-                        <div class="mo-title">Qwen3.8 27B</div>
-                        <div class="mo-desc">For complex reasoning and logic</div>
-                      </div>
-                      <span class="mo-check" hidden>✓</span>
+                      <span class="check" id="reasoningCheck" hidden>✓</span>
                     </button>
                     <hr class="think-sep" id="thinkSep" hidden />
                     <button type="button" class="think-toggle" id="btnThinkToggle" hidden>
@@ -252,25 +234,15 @@
                     </button>
                   </div>
                   <div class="model-group" data-group="agentic" hidden>
-                    <button type="button" class="model-option" data-model="agent">
-                      <div class="mo-text">
-                        <div class="mo-title">Qwen3.8 27B</div>
-                        <div class="mo-desc">Default agent, sees screenshots and reasons best</div>
-                      </div>
-                      <span class="mo-check" hidden>✓</span>
-                    </button>
-                    <button type="button" class="model-option" data-model="coder">
-                      <div class="mo-text">
-                        <div class="mo-title">Qwen3-Coder 30B</div>
-                        <div class="mo-desc">~4× faster, no vision, good for smaller jobs</div>
-                      </div>
-                      <span class="mo-check" hidden>✓</span>
-                    </button>
+                    <div class="model-options" id="agenticModelOptions"></div>
+                    <p class="mo-empty" id="agenticEmpty" hidden>
+                      No installed model can call tools. Install one from Models.
+                    </p>
                     <hr />
                     <button type="button" class="toggle-option" id="btnComputerUse">
                       <div class="mo-text">
                         <div class="mo-title">Computer use</div>
-                        <div class="mo-desc">Screenshots and UI guidance (uses Qwen3.8)</div>
+                        <div class="mo-desc" id="computerUseDesc">Screenshots and UI guidance</div>
                       </div>
                       <span class="check" id="computerUseCheck" hidden>✓</span>
                     </button>
@@ -306,6 +278,48 @@
       <div class="brand-mark warm-ring spin" id="modelWarmRing" aria-hidden="true"></div>
       <div class="model-warm-title" id="modelWarmTitle">Warming model…</div>
       <div class="model-warm-sub">This only takes a moment</div>
+    </div>
+  </div>
+
+  <!-- The model library. A full screen rather than a pane: two sources, four
+       sorts, a size filter and an endless scroll do not fit in a sidebar. -->
+  <div class="library" id="libraryScreen" hidden>
+    <header class="library-top">
+      <div class="library-sources" role="tablist">
+        <button class="library-source active" data-source="ollama" role="tab">Ollama</button>
+        <button class="library-source" data-source="huggingface" role="tab">Hugging Face</button>
+      </div>
+      <input type="search" id="librarySearch" class="library-search"
+             placeholder="Search models…" autocomplete="off" />
+      <button class="icon-btn" id="btnCloseLibrary" title="Close (Esc)">✕</button>
+    </header>
+
+    <div class="library-filters">
+      <select id="librarySort" class="library-select" title="Sort">
+        <option value="popular">Most downloaded</option>
+        <option value="trending">Trending</option>
+        <option value="updated">Recently updated</option>
+        <option value="newest">Newest</option>
+      </select>
+      <select id="libraryBand" class="library-select" title="Size">
+        <option value="">Any size</option>
+        <option value="tiny">Under 4B</option>
+        <option value="small">4B to 15B</option>
+        <option value="medium">15B to 35B</option>
+        <option value="large">35B and up</option>
+      </select>
+      <label class="library-check">
+        <input type="checkbox" id="libraryFits" class="theme-check" />
+        <span>Only what fits</span>
+      </label>
+      <span class="library-count" id="libraryCount"></span>
+    </div>
+
+    <div class="library-scroll" id="libraryScroll">
+      <div class="library-grid" id="libraryGrid"></div>
+      <!-- The sentinel scrolls with the grid. Outside the scroller it would
+           never leave the viewport, and the loader would run to exhaustion. -->
+      <div class="library-foot" id="libraryFoot"></div>
     </div>
   </div>
 
@@ -349,6 +363,29 @@
       <div class="dialog-actions">
         <button type="submit" value="cancel" formnovalidate class="btn-ghost" id="confirmCancel">Cancel</button>
         <button type="submit" value="ok" class="btn-primary danger" id="confirmOk">Delete</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="modelPickDialog">
+    <form method="dialog" class="dialog-card" id="modelPickForm">
+      <h2 id="modelPickTitle">Pick a model</h2>
+      <p id="modelPickNote" class="confirm-body"></p>
+      <div class="model-options pick-options" id="modelPickOptions"></div>
+      <button type="button" class="pick-more" id="modelPickMore" hidden>Show more</button>
+      <div class="dialog-actions">
+        <button type="submit" value="" formnovalidate class="btn-ghost">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="variantDialog">
+    <form method="dialog" class="dialog-card dialog-wide" id="variantForm">
+      <h2 id="variantTitle">Choose a version</h2>
+      <p class="confirm-body" id="variantNote"></p>
+      <div class="variant-list" id="variantList"></div>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn-ghost">Cancel</button>
       </div>
     </form>
   </dialog>

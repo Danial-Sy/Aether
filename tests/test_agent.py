@@ -1241,3 +1241,201 @@ class PlanRewriteTests(unittest.TestCase):
         self.assertEqual(result["restored"], [])
         self.assertEqual(by_id["script"], "completed")
         self.assertEqual(by_id["levels"], "in_progress")
+
+
+class ContentToolCallTests(unittest.TestCase):
+    """Weak models write tool calls into the reply instead of the tool_calls field.
+
+    Measured on llama3.2:3b with Aether's real schemas: 2 of 16 replies did it,
+    both on the deeply nested ones (todo_write, ask_user). Without a fallback
+    the loop reads them as a final answer and the run ends having done nothing.
+    """
+
+    def _names(self, content, native=None):
+        return [c["name"] for c in
+                agent.extract_tool_calls({"content": content, "tool_calls": native or []})]
+
+    def test_the_shape_llama_actually_emitted(self):
+        observed = ('{"name":"todo_write","parameters":{"merge":true,"todos":'
+                    '[{"content":"Build","status":"pending","id":"1","activeForm":"Building"}]}}')
+
+        self.assertEqual(self._names(observed), ["todo_write"])
+
+    def test_arguments_and_parameters_are_both_accepted(self):
+        for field in ("arguments", "parameters", "args"):
+            content = '{"name":"list_dir","%s":{"path":"."}}' % field
+            self.assertEqual(self._names(content), ["list_dir"], field)
+
+    def test_a_fenced_json_block_is_read(self):
+        self.assertEqual(
+            self._names('```json\n{"name":"git_status","arguments":{}}\n```'), ["git_status"])
+
+    def test_the_mistral_marker_is_read(self):
+        self.assertEqual(
+            self._names('[TOOL_CALLS] [{"name":"list_dir","arguments":{"path":"."}}]'), ["list_dir"])
+
+    def test_an_array_yields_every_call(self):
+        content = '[{"name":"list_dir","arguments":{}},{"name":"git_status","arguments":{}}]'
+
+        self.assertEqual(self._names(content), ["list_dir", "git_status"])
+
+    def test_arguments_given_as_a_json_string_are_decoded(self):
+        self.assertEqual(
+            self._names('{"name":"list_dir","arguments":"{\\"path\\": \\".\\"}"}'), ["list_dir"])
+
+    # The safety half. A false positive runs a tool the user never asked for.
+    def test_a_call_quoted_inside_prose_is_never_executed(self):
+        content = 'You could call {"name":"write_file","arguments":{"path":"x"}} to do that.'
+
+        self.assertEqual(self._names(content), [])
+
+    def test_an_unregistered_name_is_ignored(self):
+        self.assertEqual(self._names('{"name":"rm_rf","arguments":{"path":"/"}}'), [])
+
+    def test_ordinary_json_data_is_not_a_tool_call(self):
+        self.assertEqual(self._names('{"path":"a.py","size":3}'), [])
+        self.assertEqual(self._names('{"name":"a.py","size":3}'), [])
+
+    def test_prose_is_left_alone(self):
+        self.assertEqual(self._names("I finished the work and the tests pass."), [])
+
+    def test_non_dict_arguments_are_refused(self):
+        self.assertEqual(self._names('{"name":"list_dir","arguments":[1,2]}'), [])
+
+    def test_the_fallback_stands_down_when_the_model_called_natively(self):
+        native = [{"function": {"name": "list_dir", "arguments": {"path": "."}}}]
+        content = '{"name":"todo_write","parameters":{"merge":true,"todos":[]}}'
+
+        # Native wins; the content copy must not run as a second call.
+        self.assertEqual(self._names(content, native), ["list_dir"])
+
+    def test_a_marker_is_trusted_even_with_prose_around_it(self):
+        content = 'Sure, doing that now.\n<tool_call>{"name":"git_status","arguments":{}}</tool_call>'
+
+        self.assertEqual(self._names(content), ["git_status"])
+
+
+class SchemaTrimTests(unittest.TestCase):
+    """All 14 schemas cost ~4.1k tokens, which a small window cannot spare."""
+
+    def _names(self, limit):
+        return {t["function"]["name"] for t in agent.tool_defs_for({}, limit)}
+
+    def test_a_large_window_keeps_every_tool(self):
+        self.assertEqual(self._names(131072), self._names(None))
+
+    def test_the_default_agentic_window_is_not_trimmed(self):
+        # 65536 is DEFAULT_SETTINGS' agentic window; trimming it would be a
+        # regression for the model Aether was built on.
+        self.assertEqual(self._names(65536), self._names(None))
+
+    def test_a_small_window_drops_the_optional_tools(self):
+        kept = self._names(16384)
+
+        self.assertNotIn("ask_user", kept)
+        self.assertNotIn("remember", kept)
+        self.assertLess(agent.schema_tokens(agent.tool_defs_for({}, 16384)),
+                        agent.schema_tokens(agent.tool_defs_for({}, None)))
+
+    def test_the_tools_agentic_work_needs_are_never_dropped(self):
+        for limit in (16384, 8192, 2048):
+            kept = self._names(limit)
+            for essential in ("list_dir", "read_file", "write_file", "edit_file",
+                              "run_shell", "search_files", "todo_write"):
+                self.assertIn(essential, kept, f"{essential} at {limit}")
+
+    def test_trimming_is_ordered_not_arbitrary(self):
+        big, small = self._names(20000), self._names(16384)
+
+        self.assertTrue(small <= big)
+
+    def test_the_prompt_never_names_a_tool_that_was_trimmed(self):
+        defs = agent.tool_defs_for({}, 16384)
+        addon = agent.tools_system_addon(defs)
+        listed = addon.splitlines()[3].replace("Available tools: ", "").rstrip(".").split(", ")
+
+        self.assertEqual(set(listed), {t["function"]["name"] for t in defs})
+        self.assertNotIn("ask_user is the ONLY", addon)
+
+
+class BrokenToolCallTests(unittest.TestCase):
+    """A tool call written into the reply AND malformed.
+
+    Observed live on llama3.2:3b asked to plan with todo_write: it emitted
+    `"todos":[["activeForm":...]]`, square brackets where objects belonged.
+    The JSON never parses, so the arguments cannot be recovered. Executing a
+    guess would run something the model did not ask for, so the loop retries
+    instead.
+    """
+
+    def test_the_malformed_call_observed_live_is_recognised(self):
+        observed = ('{"name":"todo_write","parameters":{"merge":true,"todos":'
+                    '[["activeForm":"Update changelog","content":"Add changelog","status":"pending"]]}}')
+
+        self.assertEqual(agent.looks_like_broken_tool_call(observed), "todo_write")
+
+    def test_a_call_cut_off_mid_write_is_recognised(self):
+        truncated = '{"name":"write_file","arguments":{"path":"a.py","conte'
+
+        self.assertEqual(agent.looks_like_broken_tool_call(truncated), "write_file")
+
+    def test_a_call_that_parses_is_not_reported_as_broken(self):
+        # Those already ran as real calls; reporting them would retry forever.
+        good = '{"name":"list_dir","arguments":{"path":"."}}'
+
+        self.assertIsNone(agent.looks_like_broken_tool_call(good))
+
+    def test_prose_is_not_a_broken_call(self):
+        self.assertIsNone(agent.looks_like_broken_tool_call("I finished, everything passes."))
+        self.assertIsNone(agent.looks_like_broken_tool_call(""))
+
+    def test_json_that_names_no_tool_is_not_a_broken_call(self):
+        self.assertIsNone(agent.looks_like_broken_tool_call('{"name":"whatever","x":1}'))
+        self.assertIsNone(agent.looks_like_broken_tool_call('{"path":"a","size":3}'))
+
+    def test_no_arguments_are_ever_invented_from_broken_json(self):
+        broken = '{"name":"run_shell","arguments":{"command":"rm -rf /' 
+        # It reports only the name. Nothing here can turn into an executed call.
+        self.assertEqual(agent.looks_like_broken_tool_call(broken), "run_shell")
+        self.assertEqual(agent.extract_tool_calls({"content": broken, "tool_calls": []}), [])
+
+
+class TrailingCallTests(unittest.TestCase):
+    """Models often write a sentence and then the call.
+
+    Observed live: 'Here is the updated plan:\\n{"name": "todo_write", ...}'.
+    Requiring the JSON to reach the end of the reply is what separates that
+    from a call quoted mid-sentence, which is followed by more prose.
+    """
+
+    def _names(self, content):
+        return [c["name"] for c in agent.extract_tool_calls({"content": content, "tool_calls": []})]
+
+    def test_a_call_after_a_sentence_is_recovered(self):
+        content = 'Here is the updated plan:\n\n{"name":"todo_write","parameters":{"merge":true,"todos":[]}}'
+
+        self.assertEqual(self._names(content), ["todo_write"])
+
+    def test_a_call_with_prose_after_it_is_still_refused(self):
+        content = 'You could call {"name":"write_file","arguments":{"path":"x"}} to do that.'
+
+        self.assertEqual(self._names(content), [])
+
+    def test_trailing_data_that_names_no_tool_is_refused(self):
+        self.assertEqual(self._names('The result was: {"path":"a","size":3}'), [])
+
+    def test_a_truncated_call_is_reported_broken_not_executed(self):
+        cut = '{"name":"write_file","arguments":{"path":"a.py","conte'
+
+        self.assertEqual(self._names(cut), [])
+        self.assertEqual(agent.looks_like_broken_tool_call(cut), "write_file")
+
+    def test_a_mangled_call_after_prose_is_reported_broken(self):
+        content = 'Here is the plan:\n{"name":"todo_write","parameters":{"todos":[["a":1]]}}'
+
+        self.assertEqual(agent.looks_like_broken_tool_call(content), "todo_write")
+
+    def test_a_mangled_call_quoted_mid_sentence_is_left_alone(self):
+        content = 'Maybe {"name":"todo_write","x":1} could work, but I already did it.'
+
+        self.assertIsNone(agent.looks_like_broken_tool_call(content))

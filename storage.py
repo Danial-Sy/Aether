@@ -9,7 +9,10 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from config import CHATS, DEFAULT_SETTINGS, MEMORY, PROJECTS, SETTINGS_PATH, UPLOADS
+from config import (
+    CHATS, DEFAULT_CODER_MODEL, DEFAULT_SETTINGS, LEGACY_MODEL, MEMORY, PROJECTS,
+    ROLE_CONTEXT, SETTINGS_PATH, UPLOADS,
+)
 
 
 def _ensure() -> None:
@@ -36,23 +39,47 @@ def _write(path: Path, data: Any) -> None:
 # ── settings ──────────────────────────────────────────────────────────────
 
 # Bumped when a stored setting has to be migrated rather than merely defaulted.
-SETTINGS_VERSION = 2
+SETTINGS_VERSION = 3
 # A stored value always wins over DEFAULT_SETTINGS, so raising the agentic
 # working set needs a migration or existing installs keep the old window. Only
 # the exact old default moves; a value the user picked is left alone.
 _OLD_AGENT_CTX = 32768
 
 
+# The four named context settings became per-role, with a per-model override for
+# the one case they could disagree: two agentic models on different windows.
+_LEGACY_CTX = {"chat_context": "chat", "reasoning_context": "reasoning", "agent_context": "agentic"}
+
+
 def _migrate_settings(s: dict) -> tuple[dict, bool]:
     changed = False
-    if int(s.get("settings_version") or 0) < 2:
+    version = int(s.get("settings_version") or 0)
+    if version < 2:
         for key in ("agent_context", "coder_context"):
-            new = DEFAULT_SETTINGS.get(key)
+            new = ROLE_CONTEXT["agentic"] if key == "agent_context" else ROLE_CONTEXT["agentic"]
             if s.get(key) == _OLD_AGENT_CTX and new and new > _OLD_AGENT_CTX:
                 s[key] = new
                 changed = True
-        s["settings_version"] = SETTINGS_VERSION
         changed = True
+    if version < 3:
+        role_ctx = dict(s.get("role_context") or {})
+        for legacy, role in _LEGACY_CTX.items():
+            if s.get(legacy):
+                role_ctx[role] = int(s[legacy])
+        if role_ctx:
+            s["role_context"] = role_ctx
+        # A coder window that differed from the agent's is preserved exactly
+        # rather than averaged away, since raising it was never the user's ask.
+        coder = s.get("coder_context")
+        if coder and int(coder) != int(role_ctx.get("agentic") or 0):
+            model_ctx = dict(s.get("model_context") or {})
+            model_ctx.setdefault(DEFAULT_CODER_MODEL, int(coder))
+            s["model_context"] = model_ctx
+        for legacy in list(_LEGACY_CTX) + ["coder_context"]:
+            s.pop(legacy, None)
+        changed = True
+    if changed:
+        s["settings_version"] = SETTINGS_VERSION
     return s, changed
 
 
@@ -148,8 +175,19 @@ def _preview(c: dict) -> str:
     return ""
 
 
+def _migrate_chat(chat: dict) -> dict:
+    """Chats saved before roles addressed the agentic model by one of two names."""
+    legacy = chat.pop("agent_model", None)
+    if legacy and not chat.get("model_id"):
+        # "hybrid" swapped models mid-run and no longer exists; it maps to the
+        # executor rather than the slower dense model it also named.
+        chat["model_id"] = LEGACY_MODEL.get(legacy, DEFAULT_CODER_MODEL if legacy == "hybrid" else legacy)
+    return chat
+
+
 def get_chat(cid: str) -> dict | None:
-    return _read(CHATS / f"{cid}.json", None)
+    chat = _read(CHATS / f"{cid}.json", None)
+    return _migrate_chat(chat) if chat else chat
 
 
 PLACEHOLDER_TITLES = {
