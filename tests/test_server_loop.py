@@ -2340,6 +2340,12 @@ class ModelApiTests(unittest.IsolatedAsyncioTestCase):
             patch.object(server.st, "load_settings", return_value=store),
             patch.object(server.st, "save_settings", side_effect=save),
             patch.object(server.reg, "installed", return_value=dict(self.REGISTRY)),
+            # Fit is a claim about the model, not about whatever machine runs the
+            # suite. Unpinned, this reads real VRAM and a GPU-less runner fails.
+            patch.object(server.reg, "hardware", return_value={
+                "gpu": "test", "vram_bytes": 24 * 1024**3, "ram_bytes": 32 * 1024**3,
+                "free_disk_bytes": 500 * 1024**3, "model_store": "/tmp",
+                "usable_bytes": 24 * 1024**3}),
         )
 
     async def test_listing_reports_capability_roles_and_fit(self):
